@@ -1,6 +1,7 @@
 #!/bin/bash
 
-cd /root >/dev/null 2>&1
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:$PATH"
+cd /root >/dev/null 2>&1 || exit 1
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -34,14 +35,31 @@ err() { log "${RED}[ERR]${NC} $1"; exit 1; }
 
 reading() { read -rp "$(echo -e "${GREEN}$1${NC}")" "$2"; }
 
+find_bin() {
+    name=$1
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+        return 0
+    fi
+
+    for path in "/usr/bin/$name" "/bin/$name" "/usr/local/bin/$name"; do
+        if [ -x "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 install_package() {
     package_name=$1
     if dpkg -l 2>/dev/null | grep -q "^ii.*$package_name"; then
         ok "$package_name is installed"
     else
-        apt-get install -y $package_name >/dev/null 2>&1
+        apt-get install -y "$package_name" >/dev/null 2>&1
         if [ $? -ne 0 ]; then
-            apt-get install -y $package_name --fix-missing >/dev/null 2>&1
+            apt-get install -y "$package_name" --fix-missing >/dev/null 2>&1
         fi
         if dpkg -l 2>/dev/null | grep -q "^ii.*$package_name"; then
             ok "$package_name is installed"
@@ -54,13 +72,20 @@ install_package() {
 download_file() {
     url=$1
     output=$2
-    if command -v wget >/dev/null 2>&1; then
-        wget -q --show-progress -O "$output" "$url"
-    elif command -v curl >/dev/null 2>&1; then
-        curl -LfsS --retry 3 -o "$output" "$url"
-    else
-        return 127
+
+    wget_bin=$(find_bin wget || true)
+    if [ -n "$wget_bin" ]; then
+        "$wget_bin" -q --show-progress -O "$output" "$url"
+        return $?
     fi
+
+    curl_bin=$(find_bin curl || true)
+    if [ -n "$curl_bin" ]; then
+        "$curl_bin" -LfsS --retry 3 -o "$output" "$url"
+        return $?
+    fi
+
+    return 127
 }
 
 install_base_packages() {
@@ -69,7 +94,9 @@ install_base_packages() {
     apt-get autoremove -y >/dev/null 2>&1
 
     info "Installing base packages..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y unzip e2fsprogs bc fdisk parted wget curl ca-certificates openssl tar >/dev/null 2>&1
+    for package_name in unzip e2fsprogs bc fdisk parted wget curl ca-certificates openssl tar; do
+        install_package "$package_name"
+    done
     ok "Base packages installed"
 }
 
@@ -89,12 +116,12 @@ deploy_lxdapi() {
             err "Unsupported architecture: $sys_arch"
             ;;
     esac
-    
+
     download_url="https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main/lxdapi-linux-${arch}.tar.gz"
-    
+
     info "Downloading lxdapi..."
     info "Download URL: $download_url"
-    
+
     temp_file=$(mktemp)
     if download_file "$download_url" "$temp_file"; then
         ok "Download completed"
@@ -102,7 +129,7 @@ deploy_lxdapi() {
         rm -f "$temp_file"
         err "Download failed: please install wget or curl"
     fi
-    
+
     info "Extracting to /opt/lxdapi..."
     mkdir -p /opt/lxdapi
     tar -xzf "$temp_file" -C /opt/lxdapi --strip-components=1
@@ -111,42 +138,42 @@ deploy_lxdapi() {
 
 configure_lxdapi() {
     info "Configuring lxdapi..."
-    
+
     config_file="/opt/lxdapi/configs/config.yaml"
-    
+
     if [ ! -f "$config_file" ]; then
         err "Config file not found: $config_file"
     fi
-    
+
     reading "Server port [8443]: " server_port
     server_port=${server_port:-8443}
-    
+
     reading "API key [random]: " api_hash
     if [ -z "$api_hash" ]; then
         api_hash=$(openssl rand -hex 16)
         ok "API key generated: $api_hash"
     fi
-    
+
     reading "Admin username [admin]: " admin_user
     admin_user=${admin_user:-admin}
-    
+
     reading "Admin password [random]: " admin_pass
     if [ -z "$admin_pass" ]; then
         admin_pass=$(openssl rand -hex 8)
         ok "Admin password generated: $admin_pass"
     fi
-    
+
     session_secret=$(openssl rand -hex 16)
-    
+
     reading "Traffic collection interval seconds [20]: " traffic_interval
     traffic_interval=${traffic_interval:-20}
-    
+
     reading "Traffic batch update size [10]: " traffic_batch_size
     traffic_batch_size=${traffic_batch_size:-10}
-    
+
     reading "Task auto cleanup days [7]: " auto_cleanup_days
     auto_cleanup_days=${auto_cleanup_days:-7}
-   
+
     reading "Enable Nginx reverse proxy plugin? y/n [y]: " nginx_enabled
     nginx_enabled=${nginx_enabled:-y}
     if [[ "$nginx_enabled" =~ ^[yY]$ ]]; then
@@ -155,7 +182,7 @@ configure_lxdapi() {
         systemctl start nginx >/dev/null 2>&1
         ok "nginx installed and started"
         nginx_enabled_value="true"
-   
+
         reading "Enable ACME certificate plugin? y/n [y]: " acme_enabled
         acme_enabled=${acme_enabled:-y}
         if [[ "$acme_enabled" =~ ^[yY]$ ]]; then
@@ -168,10 +195,10 @@ configure_lxdapi() {
         nginx_enabled_value="false"
         acme_enabled_value="false"
     fi
-   
+
     task_backend="memory"
     db_type="sqlite"
-   
+
     info "Writing config..."
     sed -i "s|__SERVER_PORT__|$server_port|g" "$config_file"
     sed -i "s|__API_HASH__|$api_hash|g" "$config_file"
@@ -200,22 +227,22 @@ configure_lxdapi() {
     sed -i "s|__POSTGRES_SSLMODE__|disable|g" "$config_file"
     sed -i "s|__NGINX_ENABLED__|$nginx_enabled_value|g" "$config_file"
     sed -i "s|__ACME_ENABLED__|$acme_enabled_value|g" "$config_file"
-   
+
     ok "Config updated (SQLite & Memory mode)"
 }
 
 setup_lxdapi_service() {
     info "Configuring lxdapi system service..."
-    
+
     config_file="/opt/lxdapi/configs/config.yaml"
     if [ ! -f "$config_file" ]; then
         err "Config file not found: $config_file"
     fi
-    
+
     if grep -q "__SERVER_PORT__" "$config_file"; then
         err "Config file is not complete"
     fi
-    
+
     sys_arch=$(uname -m)
     case $sys_arch in
         x86_64)
@@ -228,9 +255,9 @@ setup_lxdapi_service() {
             err "Unsupported architecture: $sys_arch"
             ;;
     esac
-    
+
     service_file="/etc/systemd/system/lxdapi.service"
-    
+
     cat > "$service_file" << EOF
 [Unit]
 Description=LXD API Server
@@ -251,20 +278,20 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-    
+
     ok "Service file created: $service_file"
-    
+
     systemctl daemon-reload
     systemctl enable lxdapi
     systemctl start lxdapi
-    
+
     info "Waiting for service startup..."
     for i in {1..10}; do
         printf "\r[%-10s] %d/10s" "$(printf '#%.0s' $(seq 1 $i))" "$i"
         sleep 1
     done
     echo
-    
+
     if systemctl is-active --quiet lxdapi; then
         ok "lxdapi service started"
     else
@@ -280,7 +307,7 @@ main() {
     echo "        by Github-lovejapan1"
     echo "========================================"
     echo
-    
+
     echo "======== Step 1/5: Base packages ========"
     reading "Install base packages? (y/n) [y]: " step1_confirm
     step1_confirm=${step1_confirm:-y}
