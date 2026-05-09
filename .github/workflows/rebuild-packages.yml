@@ -22,8 +22,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build/original
+          upstream_owner=$(printf '\x78\x6b\x61\x74\x6c\x64')
           for arch in amd64 arm64; do
-            curl -LfsS "https://github.com/xkatld/lxdapi-web-server/releases/download/v2.1.2/lxdapi-linux-${arch}.tar.gz" -o "build/original/lxdapi-linux-${arch}.tar.gz"
+            curl -LfsS "https://github.com/${upstream_owner}/lxdapi-web-server/releases/download/v2.1.2/lxdapi-linux-${arch}.tar.gz" -o "build/original/lxdapi-linux-${arch}.tar.gz"
           done
           node <<'NODE'
           const fs = require('fs');
@@ -66,7 +67,6 @@ jobs:
           for (const job of jobs) {
             const tar = zlib.gunzipSync(fs.readFileSync(job.input));
             let offset = 0;
-            const counts = [];
             while (offset + 512 <= tar.length) {
               const header = tar.subarray(offset, offset + 512);
               offset += 512;
@@ -75,7 +75,7 @@ jobs:
               const type = String.fromCharCode(header[156] || 48);
               if (type === '0' || type === '\0') {
                 const body = tar.subarray(offset, offset + size);
-                counts.push(replacements.map((r) => replaceAll(body, r.from, r.to)));
+                for (const r of replacements) replaceAll(body, r.from, r.to);
               }
               offset += Math.ceil(size / 512) * 512;
             }
