@@ -1,5 +1,4 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH:-}"
 
@@ -10,8 +9,6 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 LXC="/snap/bin/lxc"
-OS_NAME="unknown"
-PKG_MANAGER="unknown"
 
 ok() { echo -e "${GREEN}[OK]${NC} $1"; }
 err() { echo -e "${RED}[ERROR]${NC} $1"; }
@@ -22,31 +19,7 @@ reading() {
     read -rp "$(echo -e "${GREEN}[INPUT]${NC} $1")" "$2"
 }
 
-detect_system() {
-    if [ -r /etc/os-release ]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        OS_NAME="${PRETTY_NAME:-${ID:-unknown}}"
-    fi
-
-    if command -v apt-get >/dev/null 2>&1; then
-        PKG_MANAGER="apt"
-    elif command -v dnf >/dev/null 2>&1; then
-        PKG_MANAGER="dnf"
-    elif command -v yum >/dev/null 2>&1; then
-        PKG_MANAGER="yum"
-    elif command -v zypper >/dev/null 2>&1; then
-        PKG_MANAGER="zypper"
-    elif command -v pacman >/dev/null 2>&1; then
-        PKG_MANAGER="pacman"
-    fi
-
-    ok "系统: $OS_NAME"
-    ok "包管理器: $PKG_MANAGER"
-}
-
 detect_arch() {
-    local sys_arch
     sys_arch=$(uname -m)
     case $sys_arch in
         x86_64|amd64)
@@ -60,140 +33,54 @@ detect_arch() {
             exit 1
             ;;
     esac
-    ok "系统架构: ${sys_arch} -> 镜像架构: $ARCH"
-}
-
-install_packages() {
-    if [ "$(id -u)" -ne 0 ]; then
-        warn "当前不是 root，无法自动安装依赖"
-        return 1
-    fi
-
-    case "$PKG_MANAGER" in
-        apt)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y "$@"
-            ;;
-        dnf)
-            dnf install -y "$@"
-            ;;
-        yum)
-            yum install -y "$@"
-            ;;
-        zypper)
-            zypper --non-interactive install "$@"
-            ;;
-        pacman)
-            pacman -Sy --noconfirm "$@"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-install_lxd() {
-    if [ "$(id -u)" -ne 0 ]; then
-        err "未找到 lxc，且当前不是 root，无法自动安装 LXD"
-        return 1
-    fi
-
-    info "未找到 lxc，按照当前系统自动安装 LXD..."
-
-    if ! command -v snap >/dev/null 2>&1; then
-        info "安装 snapd..."
-        install_packages snapd || return 1
-    fi
-
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable --now snapd.socket >/dev/null 2>&1 || true
-        systemctl start snapd >/dev/null 2>&1 || true
-    fi
-
-    if [ -d /var/lib/snapd/snap ] && [ ! -e /snap ]; then
-        ln -s /var/lib/snapd/snap /snap
-    fi
-
-    if ! command -v snap >/dev/null 2>&1; then
-        err "snapd 安装后仍不可用，无法自动安装 LXD"
-        return 1
-    fi
-
-    snap wait system seed.loaded >/dev/null 2>&1 || true
-
-    if snap list lxd >/dev/null 2>&1; then
-        return 0
-    fi
-
-    snap install lxd
+    ok "系统架构: $ARCH"
 }
 
 ensure_lxc() {
     if [ -x "$LXC" ]; then
-        ok "LXD 命令: $LXC"
         return
     fi
 
     if command -v lxc >/dev/null 2>&1; then
         LXC="$(command -v lxc)"
-        ok "LXD 命令: $LXC"
         return
     fi
 
-    install_lxd || {
-        err "LXD 自动安装失败，请先手动安装并初始化 LXD"
-        exit 1
-    }
-
-    if [ -x "$LXC" ]; then
-        ok "LXD 命令: $LXC"
-        return
-    fi
-
-    if command -v lxc >/dev/null 2>&1; then
-        LXC="$(command -v lxc)"
-        ok "LXD 命令: $LXC"
-        return
-    fi
-
-    err "LXD 安装后仍未找到 lxc 命令，请重新登录 shell 或检查 snapd"
+    err "未找到 lxc 命令，请先安装并初始化 LXD"
     exit 1
 }
 
-install_download_tools() {
-    info "按照当前系统自动安装下载工具 wget/curl..."
-    install_packages wget curl ca-certificates
+install_downloader() {
+    if [ "$(id -u)" -ne 0 ]; then
+        return 1
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y wget curl ca-certificates
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y wget curl ca-certificates
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y wget curl ca-certificates
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive install wget curl ca-certificates
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm wget curl ca-certificates
+    else
+        return 1
+    fi
 }
 
 ensure_downloader() {
-    if command -v wget >/dev/null 2>&1; then
-        ok "下载工具: $(command -v wget)"
+    if command -v wget >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
         return
     fi
 
-    if command -v curl >/dev/null 2>&1; then
-        ok "下载工具: $(command -v curl)"
-        return
-    fi
-
-    if ! install_download_tools; then
+    info "未找到 wget/curl，正在按当前系统自动安装..."
+    if ! install_downloader; then
         err "未找到 wget 或 curl，请先安装其中一个"
         exit 1
     fi
-
-    if command -v wget >/dev/null 2>&1; then
-        ok "下载工具: $(command -v wget)"
-        return
-    fi
-
-    if command -v curl >/dev/null 2>&1; then
-        ok "下载工具: $(command -v curl)"
-        return
-    fi
-
-    err "wget/curl 安装后仍不可用，请检查 PATH"
-    exit 1
 }
 
 download_file() {
@@ -201,7 +88,7 @@ download_file() {
     local url="$2"
 
     if command -v wget >/dev/null 2>&1; then
-        wget -q --show-progress -O "$output" "$url"
+        wget -q --show-progress -O "$output" "$url" 2>&1
     elif command -v curl >/dev/null 2>&1; then
         curl -fL --progress-bar -o "$output" "$url"
     else
@@ -238,24 +125,29 @@ download_and_import() {
     local image_name="$1"
     local image_type="$2"
     local image_url="${IMAGES_BASE_URL}/${image_name}-${ARCH}-${image_type}.tar.gz"
+    local alias="${image_name}-${image_type}"
     local temp_file
-    temp_file=$(mktemp)
+
+    if "$LXC" image info "$alias" >/dev/null 2>&1; then
+        ok "镜像已存在: $alias"
+        return
+    fi
 
     info "下载: ${image_name}-${ARCH}-${image_type}.tar.gz"
 
+    temp_file=$(mktemp)
     if download_file "$temp_file" "$image_url"; then
         info "导入到 LXD..."
-        local alias="${image_name}-${image_type}"
         if "$LXC" image import "$temp_file" --alias "$alias" 2>/dev/null; then
             ok "成功导入: $alias"
         else
             warn "导入失败: $alias"
         fi
+        rm -f "$temp_file"
     else
         warn "下载失败: ${image_name}-${ARCH}-${image_type}"
+        rm -f "$temp_file"
     fi
-
-    rm -f "$temp_file"
 }
 
 show_image_list() {
@@ -319,7 +211,7 @@ menu_import() {
 
     current=0
     for img in "${selected_images[@]}"; do
-        current=$((current + 1))
+        ((current++))
         echo "[$current/${#selected_images[@]}]"
         download_and_import "$img" "$image_type"
         echo
@@ -379,7 +271,6 @@ main_menu() {
     done
 }
 
-detect_system
 detect_arch
 ensure_lxc
 ensure_downloader
