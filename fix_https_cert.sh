@@ -65,13 +65,24 @@ if [ -n "$cert_email" ]; then
 fi
 
 info "Requesting certificate for $cert_name..."
-certbot certonly \
-    --standalone \
-    --preferred-challenges http \
-    -d "$cert_name" \
-    --agree-tos \
-    --non-interactive \
-    "${email_args[@]}"
+if [[ "$cert_name" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    certbot certonly \
+        --standalone \
+        --preferred-challenges http \
+        --preferred-profile shortlived \
+        --ip-address "$cert_name" \
+        --agree-tos \
+        --non-interactive \
+        "${email_args[@]}"
+else
+    certbot certonly \
+        --standalone \
+        --preferred-challenges http \
+        -d "$cert_name" \
+        --agree-tos \
+        --non-interactive \
+        "${email_args[@]}"
+fi
 
 src_dir="/etc/letsencrypt/live/$cert_name"
 [ -f "$src_dir/fullchain.pem" ] || err "Certificate was not created: $src_dir/fullchain.pem"
