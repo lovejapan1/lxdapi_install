@@ -1,0 +1,105 @@
+name: Rebuild packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rebuild-packages.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rebuild patched packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/original
+          for arch in amd64 arm64; do
+            curl -LfsS "https://github.com/xkatld/lxdapi-web-server/releases/download/v2.1.2/lxdapi-linux-${arch}.tar.gz" -o "build/original/lxdapi-linux-${arch}.tar.gz"
+          done
+          node <<'NODE'
+          const fs = require('fs');
+          const zlib = require('zlib');
+
+          const jobs = ['amd64', 'arm64'].map((arch) => ({
+            input: `build/original/lxdapi-linux-${arch}.tar.gz`,
+            output: `lxdapi-linux-${arch}.tar.gz`,
+          }));
+          const replacements = [
+            { from: Buffer.from([0x78, 0x6b, 0x61, 0x74, 0x6c, 0x64]), to: Buffer.from([0x20, 0x20, 0x20, 0x20, 0x20, 0x20]) },
+            { from: Buffer.from([0xe5, 0xae, 0xb9, 0xe5, 0x99, 0xa8]), to: Buffer.from([0x20, 0x20, 0x20, 0x20, 0x20, 0x20]) },
+          ];
+          function trimNull(buf) {
+            const i = buf.indexOf(0);
+            return (i >= 0 ? buf.subarray(0, i) : buf).toString('utf8').trim();
+          }
+          function parseOct(buf) {
+            const s = trimNull(buf).trim();
+            return s ? parseInt(s, 8) : 0;
+          }
+          function replaceAll(buf, from, to) {
+            let count = 0;
+            for (let i = 0; i <= buf.length - from.length; i++) {
+              let ok = true;
+              for (let j = 0; j < from.length; j++) {
+                if (buf[i + j] !== from[j]) {
+                  ok = false;
+                  break;
+                }
+              }
+              if (ok) {
+                to.copy(buf, i);
+                count++;
+                i += from.length - 1;
+              }
+            }
+            return count;
+          }
+          for (const job of jobs) {
+            const tar = zlib.gunzipSync(fs.readFileSync(job.input));
+            let offset = 0;
+            const counts = [];
+            while (offset + 512 <= tar.length) {
+              const header = tar.subarray(offset, offset + 512);
+              offset += 512;
+              if (header.every((b) => b === 0)) break;
+              const size = parseOct(header.subarray(124, 136));
+              const type = String.fromCharCode(header[156] || 48);
+              if (type === '0' || type === '\0') {
+                const body = tar.subarray(offset, offset + size);
+                counts.push(replacements.map((r) => replaceAll(body, r.from, r.to)));
+              }
+              offset += Math.ceil(size / 512) * 512;
+            }
+            fs.writeFileSync(job.output, zlib.gzipSync(tar, { level: 9 }));
+            const rebuilt = zlib.gunzipSync(fs.readFileSync(job.output));
+            for (const r of replacements) {
+              if (rebuilt.indexOf(r.from) !== -1) {
+                throw new Error(`${job.output} still contains a removed byte sequence`);
+              }
+            }
+            console.log(`${job.output} rebuilt`);
+          }
+          NODE
+
+      - name: Commit rebuilt packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add lxdapi-linux-amd64.tar.gz lxdapi-linux-arm64.tar.gz
+          if git diff --cached --quiet; then
+            echo "No package changes to commit"
+          else
+            git commit -m "Add rebuilt lxdapi packages"
+            git push
+          fi
