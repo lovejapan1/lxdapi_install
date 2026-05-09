@@ -319,7 +319,7 @@ menu_import() {
 
     current=0
     for img in "${selected_images[@]}"; do
-        ((current++))
+        current=$((current + 1))
         echo "[$current/${#selected_images[@]}]"
         download_and_import "$img" "$image_type"
         echo
