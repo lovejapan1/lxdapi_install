@@ -35,39 +35,62 @@ jobs:
             output: `lxdapi-linux-${arch}.tar.gz`,
           }));
 
-          function paddedAscii(text, length) {
-            const raw = Buffer.from(text, 'ascii');
+          function paddedUtf8(text, length) {
+            const raw = Buffer.from(text, 'utf8');
             if (raw.length > length) throw new Error(`${text} is longer than ${length} bytes`);
             return Buffer.concat([raw, Buffer.alloc(length - raw.length, 0x20)]);
           }
 
-          const cnContainer = Buffer.from([0xe5, 0xae, 0xb9, 0xe5, 0x99, 0xa8]);
-          const cnManagePlatform = Buffer.from([0xe7, 0xae, 0xa1, 0xe7, 0x90, 0x86, 0xe5, 0xb9, 0xb3, 0xe5, 0x8f, 0xb0]);
-          const brandFooterAfterContainerPatch = Buffer.concat([
-            Buffer.from('LXD API', 'ascii'),
-            Buffer.alloc(7, 0x20),
-            cnManagePlatform,
-          ]);
-          const brandFooterPlain = Buffer.concat([
-            Buffer.from('LXD API ', 'ascii'),
-            cnManagePlatform,
-          ]);
-
-          const replacements = [
-            { from: Buffer.from([0x78, 0x6b, 0x61, 0x74, 0x6c, 0x64]), to: Buffer.from([0x20, 0x20, 0x20, 0x20, 0x20, 0x20]) },
-            { from: cnContainer, to: Buffer.from([0x20, 0x20, 0x20, 0x20, 0x20, 0x20]) },
-            { from: brandFooterAfterContainerPatch, to: paddedAscii('Sakura', brandFooterAfterContainerPatch.length) },
-            { from: brandFooterPlain, to: paddedAscii('Sakura', brandFooterPlain.length) },
+          const replacementSpecs = [
+            ['https://github.com/xkatld/lxdapi-web-server', 'https://github.com/lovejapan1/lxdapi'],
+            ['https://github.com/      /lxdapi-web-server', 'https://github.com/lovejapan1/lxdapi'],
+            ['https://github.com/Sakura/lxdapi-web-server', 'https://github.com/lovejapan1/lxdapi'],
+            ['Github-xkatld', 'Sakura'],
+            ['github-xkatld', 'sakura'],
+            ['xkatld', 'Sakura'],
+            ['LXD API 容器管理平台', 'Sakura'],
+            ['LXD API       管理平台', 'Sakura'],
+            ['LXD API 管理平台', 'Sakura'],
+            ['LXD API - 管理后台', 'Sakura - 管理后台'],
+            ['LXD API - 用户中心', 'Sakura - 用户中心'],
+            ['LXD API 管理', 'Sakura'],
+            ['LXD API', 'Sakura '],
+            ['容器', ''],
           ];
+
+          const replacements = replacementSpecs.map(([from, to]) => {
+            const fromBuf = Buffer.from(from, 'utf8');
+            return { from: fromBuf, to: paddedUtf8(to, fromBuf.length), label: from };
+          });
+
+          const forbiddenSpecs = [
+            'LXD API 容器管理平台',
+            'LXD API       管理平台',
+            'LXD API 管理平台',
+            'LXD API - 管理后台',
+            'LXD API - 用户中心',
+            'LXD API 管理',
+            'LXD API',
+            '容器',
+            'xkatld',
+            'Github-xkatld',
+            'github-xkatld',
+            'https://github.com/xkatld/lxdapi-web-server',
+            'https://github.com/      /lxdapi-web-server',
+            'https://github.com/Sakura/lxdapi-web-server',
+          ];
+          const forbidden = forbiddenSpecs.map((s) => ({ label: s, bytes: Buffer.from(s, 'utf8') }));
 
           function trimNull(buf) {
             const i = buf.indexOf(0);
             return (i >= 0 ? buf.subarray(0, i) : buf).toString('utf8').trim();
           }
+
           function parseOct(buf) {
             const s = trimNull(buf).trim();
             return s ? parseInt(s, 8) : 0;
           }
+
           function replaceAll(buf, from, to) {
             let count = 0;
             for (let i = 0; i <= buf.length - from.length; i++) {
@@ -86,32 +109,43 @@ jobs:
             }
             return count;
           }
+
           for (const job of jobs) {
             const tar = zlib.gunzipSync(fs.readFileSync(job.input));
+            const counts = new Map(replacements.map((r) => [r.label, 0]));
             let offset = 0;
+
             while (offset + 512 <= tar.length) {
               const header = tar.subarray(offset, offset + 512);
               offset += 512;
               if (header.every((b) => b === 0)) break;
+
               const size = parseOct(header.subarray(124, 136));
               const type = String.fromCharCode(header[156] || 48);
               if (type === '0' || type === '\0') {
                 const body = tar.subarray(offset, offset + size);
-                for (const r of replacements) replaceAll(body, r.from, r.to);
+                for (const r of replacements) {
+                  counts.set(r.label, counts.get(r.label) + replaceAll(body, r.from, r.to));
+                }
               }
               offset += Math.ceil(size / 512) * 512;
             }
+
             fs.writeFileSync(job.output, zlib.gzipSync(tar, { level: 9 }));
             const rebuilt = zlib.gunzipSync(fs.readFileSync(job.output));
-            for (const r of replacements.slice(0, 3)) {
-              if (rebuilt.indexOf(r.from) !== -1) {
-                throw new Error(`${job.output} still contains a removed byte sequence`);
+            for (const item of forbidden) {
+              if (rebuilt.indexOf(item.bytes) !== -1) {
+                throw new Error(`${job.output} still contains ${item.label}`);
               }
             }
-            if (rebuilt.indexOf(Buffer.from('Sakura', 'ascii')) === -1) {
+            if (rebuilt.indexOf(Buffer.from('Sakura', 'utf8')) === -1) {
               throw new Error(`${job.output} does not contain Sakura`);
             }
+
             console.log(`${job.output} rebuilt`);
+            for (const [label, count] of counts) {
+              if (count > 0) console.log(`  ${label}: ${count}`);
+            }
           }
           NODE
 
