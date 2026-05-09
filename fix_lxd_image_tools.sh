@@ -12,6 +12,12 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+mkdir -p /etc/profile.d
+cat >/etc/profile.d/lxdapi-tools-path.sh <<'EOF'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH:-}"
+EOF
+chmod 644 /etc/profile.d/lxdapi-tools-path.sh
+
 install_with_apt() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
@@ -78,4 +84,6 @@ ok "Download tools fixed"
 echo "wget: $(command -v wget)"
 echo "curl:  $(command -v curl)"
 echo
+echo "For the current shell, run:"
+echo 'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH:-}"'
 echo "Now rerun the LXD image manager and import the image again."
