@@ -34,10 +34,32 @@ jobs:
             input: `build/original/lxdapi-linux-${arch}.tar.gz`,
             output: `lxdapi-linux-${arch}.tar.gz`,
           }));
+
+          function paddedAscii(text, length) {
+            const raw = Buffer.from(text, 'ascii');
+            if (raw.length > length) throw new Error(`${text} is longer than ${length} bytes`);
+            return Buffer.concat([raw, Buffer.alloc(length - raw.length, 0x20)]);
+          }
+
+          const cnContainer = Buffer.from([0xe5, 0xae, 0xb9, 0xe5, 0x99, 0xa8]);
+          const cnManagePlatform = Buffer.from([0xe7, 0xae, 0xa1, 0xe7, 0x90, 0x86, 0xe5, 0xb9, 0xb3, 0xe5, 0x8f, 0xb0]);
+          const brandFooterAfterContainerPatch = Buffer.concat([
+            Buffer.from('LXD API', 'ascii'),
+            Buffer.alloc(7, 0x20),
+            cnManagePlatform,
+          ]);
+          const brandFooterPlain = Buffer.concat([
+            Buffer.from('LXD API ', 'ascii'),
+            cnManagePlatform,
+          ]);
+
           const replacements = [
             { from: Buffer.from([0x78, 0x6b, 0x61, 0x74, 0x6c, 0x64]), to: Buffer.from([0x20, 0x20, 0x20, 0x20, 0x20, 0x20]) },
-            { from: Buffer.from([0xe5, 0xae, 0xb9, 0xe5, 0x99, 0xa8]), to: Buffer.from([0x20, 0x20, 0x20, 0x20, 0x20, 0x20]) },
+            { from: cnContainer, to: Buffer.from([0x20, 0x20, 0x20, 0x20, 0x20, 0x20]) },
+            { from: brandFooterAfterContainerPatch, to: paddedAscii('Sakura', brandFooterAfterContainerPatch.length) },
+            { from: brandFooterPlain, to: paddedAscii('Sakura', brandFooterPlain.length) },
           ];
+
           function trimNull(buf) {
             const i = buf.indexOf(0);
             return (i >= 0 ? buf.subarray(0, i) : buf).toString('utf8').trim();
@@ -81,10 +103,13 @@ jobs:
             }
             fs.writeFileSync(job.output, zlib.gzipSync(tar, { level: 9 }));
             const rebuilt = zlib.gunzipSync(fs.readFileSync(job.output));
-            for (const r of replacements) {
+            for (const r of replacements.slice(0, 3)) {
               if (rebuilt.indexOf(r.from) !== -1) {
                 throw new Error(`${job.output} still contains a removed byte sequence`);
               }
+            }
+            if (rebuilt.indexOf(Buffer.from('Sakura', 'ascii')) === -1) {
+              throw new Error(`${job.output} does not contain Sakura`);
             }
             console.log(`${job.output} rebuilt`);
           }
@@ -100,6 +125,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No package changes to commit"
           else
-            git commit -m "Add rebuilt lxdapi packages"
+            git commit -m "Update patched lxdapi packages"
             git push
           fi
