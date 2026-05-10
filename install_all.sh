@@ -9,6 +9,8 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 BASE_URL="https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main"
+CONFIG_FILE="/opt/lxdapi/configs/config.yaml"
+SERVICE_NAME="lxdapi"
 
 log() { echo -e "$1"; }
 ok() { log "${GREEN}[OK]${NC} $1"; }
@@ -83,7 +85,6 @@ download_file() {
 
 run_remote_script() {
     local name="$1"
-    shift || true
     local url="${BASE_URL}/${name}"
     local tmp
     tmp=$(mktemp)
@@ -95,10 +96,125 @@ run_remote_script() {
     fi
 
     chmod +x "$tmp"
-    bash "$tmp" "$@"
+    bash "$tmp"
     local rc=$?
     rm -f "$tmp"
     return $rc
+}
+
+ensure_lxc_path() {
+    if [ -x /snap/bin/lxc ]; then
+        ln -sf /snap/bin/lxc /usr/local/bin/lxc
+        hash -r 2>/dev/null || true
+        ok "已修复 lxc 路径: /usr/local/bin/lxc -> /snap/bin/lxc"
+    fi
+}
+
+list_lxd_instances() {
+    command -v lxc >/dev/null 2>&1 || return 0
+    lxc list --format csv -c n 2>/dev/null | sed '/^[[:space:]]*$/d' || true
+}
+
+offer_cleanup_existing_lxd_instances() {
+    ensure_lxc_path
+    command -v lxc >/dev/null 2>&1 || return 0
+
+    local names
+    names=$(list_lxd_instances)
+    [ -z "$names" ] && return 0
+
+    warn "检测到 LXD 里已经存在实例："
+    echo "$names" | sed 's/^/  - /'
+    warn "如果这是重新安装面板，面板数据库可能为空，但 LXD 里残留实例会导致创建同名服务器时报“容器已存在”。"
+    reading "是否删除这些 LXD 实例？这会删除对应服务器数据，默认不删除 (y/n) [n]：" cleanup_confirm
+    cleanup_confirm=${cleanup_confirm:-n}
+
+    if [[ "$cleanup_confirm" =~ ^[yY]$ ]]; then
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            warn "删除 LXD 实例: $name"
+            lxc delete -f "$name" || err "删除 LXD 实例失败: $name"
+        done << EOF
+$names
+EOF
+        ok "已清理 LXD 残留实例"
+    else
+        warn "已保留现有 LXD 实例。请创建服务器时避开同名，或手动执行 lxc delete -f 名称。"
+    fi
+}
+
+disable_lxdapi_acme() {
+    [ -f "$CONFIG_FILE" ] || return 0
+
+    local tmp_file
+    tmp_file=$(mktemp)
+    awk '
+        /^  acme:/ { in_acme=1; print; next }
+        in_acme && /^  [^[:space:]]/ { in_acme=0 }
+        in_acme && /^[[:space:]]*enabled:[[:space:]]*/ {
+            sub(/enabled:[[:space:]]*.*/, "enabled: false")
+        }
+        { print }
+    ' "$CONFIG_FILE" > "$tmp_file" || err "生成新配置失败"
+
+    mv "$tmp_file" "$CONFIG_FILE" || err "写入配置失败"
+    pkill -f "acme.sh --issue" >/dev/null 2>&1 || true
+    ok "已关闭 ACME 插件，避免纯 IP 证书签发卡住服务"
+}
+
+get_lxdapi_port() {
+    local port="8443"
+    if [ -f "$CONFIG_FILE" ]; then
+        local parsed
+        parsed=$(awk '
+            /^server:/ { in_server=1; next }
+            in_server && /^[^[:space:]]/ { in_server=0 }
+            in_server && /^[[:space:]]*port:/ {
+                gsub(/[^0-9]/, "", $0)
+                print $0
+                exit
+            }
+        ' "$CONFIG_FILE")
+        [ -n "$parsed" ] && port="$parsed"
+    fi
+    echo "$port"
+}
+
+restart_lxdapi_after_install() {
+    if ! systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
+        warn "未找到 ${SERVICE_NAME}.service，跳过服务重启"
+        return 0
+    fi
+
+    systemctl daemon-reload
+    systemctl restart "$SERVICE_NAME" || err "重启 $SERVICE_NAME 失败"
+    sleep 3
+
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "$SERVICE_NAME 已重启并运行"
+    else
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+        err "$SERVICE_NAME 未正常运行"
+    fi
+
+    local port
+    port=$(get_lxdapi_port)
+    local curl_bin
+    curl_bin=$(find_bin curl || true)
+    if [ -n "$curl_bin" ]; then
+        if "$curl_bin" -k -m 8 -fsS "https://127.0.0.1:${port}/admin/login" >/dev/null 2>&1; then
+            ok "面板本地 HTTPS 检测通过: https://127.0.0.1:${port}/admin/login"
+        else
+            warn "面板本地 HTTPS 检测未通过，请查看 journalctl -u lxdapi -n 80 --no-pager"
+        fi
+    fi
+}
+
+post_panel_install_fix() {
+    info "执行安装后修复：lxc 路径、ACME、服务状态..."
+    ensure_lxc_path
+    disable_lxdapi_acme
+    restart_lxdapi_after_install
 }
 
 show_header() {
@@ -116,14 +232,15 @@ show_menu() {
     echo "4. 导入 LXD 镜像"
     echo "5. 更新 Sakura 面板"
     echo "6. 卸载 Sakura 面板"
-    echo "7. 修复运行环境（清理残留服务器 / 关闭 ACME）"
     echo "0. 退出"
     echo
 }
 
 run_full_install() {
     run_remote_script "lxd_install.sh" || err "LXD 安装失败"
+    offer_cleanup_existing_lxd_instances
     run_remote_script "lxdapi_install.sh" || err "面板安装失败"
+    post_panel_install_fix
     run_remote_script "image_import.sh" || err "镜像导入脚本执行失败"
     ok "一键完整安装流程执行完成"
     print_urls
@@ -131,10 +248,12 @@ run_full_install() {
 
 install_lxd_only() {
     run_remote_script "lxd_install.sh" || err "LXD 安装失败"
+    offer_cleanup_existing_lxd_instances
 }
 
 install_panel_only() {
     run_remote_script "lxdapi_install.sh" || err "面板安装失败"
+    post_panel_install_fix
     print_urls
 }
 
@@ -144,25 +263,13 @@ import_images_only() {
 
 update_panel_only() {
     run_remote_script "lxdapi_update.sh" || err "面板更新失败"
+    post_panel_install_fix
     print_urls
 }
 
 uninstall_panel_only() {
     warn "卸载只会删除 Sakura/LXDAPI 面板，不会删除 LXD、镜像和已创建的服务器。"
     run_remote_script "lxdapi_uninstall.sh" || err "面板卸载失败"
-}
-
-repair_runtime() {
-    local instance_name="${1:-}"
-    if [ -z "$instance_name" ]; then
-        reading "请输入要清理的残留服务器名，留空只修复 ACME 和服务状态：" instance_name
-    fi
-
-    if [ -n "$instance_name" ]; then
-        warn "将检查并删除 LXD 中名为 ${instance_name} 的残留实例。"
-    fi
-
-    run_remote_script "fix_lxdapi_runtime.sh" "$instance_name" || err "运行环境修复失败"
 }
 
 print_urls() {
@@ -173,7 +280,6 @@ print_urls() {
 
 run_choice() {
     local choice="$1"
-    shift || true
     case "$choice" in
         1|install|all)
             run_full_install
@@ -193,9 +299,6 @@ run_choice() {
         6|uninstall|remove)
             uninstall_panel_only
             ;;
-        7|repair|fix)
-            repair_runtime "${1:-}"
-            ;;
         0|exit|quit)
             info "已退出"
             exit 0
@@ -212,12 +315,12 @@ main() {
     show_header
 
     if [ -n "${1:-}" ]; then
-        run_choice "$@"
+        run_choice "$1"
         exit 0
     fi
 
     show_menu
-    reading "请选择 [1-7]，默认一键完整安装 [1]：" choice
+    reading "请选择 [1-6]，默认一键完整安装 [1]：" choice
     choice=${choice:-1}
     run_choice "$choice"
 }
