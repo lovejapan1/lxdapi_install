@@ -26,7 +26,7 @@ find_bin() {
         return 0
     fi
 
-    for path in "/usr/bin/$name" "/bin/$name" "/usr/local/bin/$name"; do
+    for path in "/usr/bin/$name" "/bin/$name" "/usr/local/bin/$name" "/snap/bin/$name"; do
         if [ -x "$path" ]; then
             echo "$path"
             return 0
@@ -34,6 +34,16 @@ find_bin() {
     done
 
     return 1
+}
+
+install_package() {
+    local package_name="$1"
+    if dpkg -l 2>/dev/null | grep -q "^ii.*$package_name"; then
+        return 0
+    fi
+
+    apt-get update >/dev/null 2>&1 || true
+    apt-get install -y "$package_name" >/dev/null 2>&1 || apt-get install -y "$package_name" --fix-missing >/dev/null 2>&1 || return 1
 }
 
 download_file() {
@@ -55,6 +65,83 @@ download_file() {
     fi
 
     return 127
+}
+
+ensure_lxd() {
+    info "检查 LXD/lxc 环境..."
+
+    if [ -x /snap/bin/lxc ]; then
+        ln -sf /snap/bin/lxc /usr/local/bin/lxc
+        hash -r 2>/dev/null || true
+    fi
+
+    if command -v lxc >/dev/null 2>&1; then
+        if lxc list >/dev/null 2>&1; then
+            ok "LXD/lxc 已就绪"
+            return 0
+        fi
+        if command -v lxd >/dev/null 2>&1; then
+            info "检测到 lxc 但 LXD 未初始化，正在执行 lxd init --auto..."
+            lxd init --auto >/dev/null 2>&1 || true
+            if lxc list >/dev/null 2>&1; then
+                ok "LXD/lxc 已就绪"
+                return 0
+            fi
+        fi
+    fi
+
+    info "安装并初始化 LXD snap..."
+    if ! command -v snap >/dev/null 2>&1; then
+        install_package snapd || err "snapd 安装失败，无法自动安装 LXD"
+    fi
+
+    systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+    systemctl restart snapd >/dev/null 2>&1 || true
+
+    for _ in {1..20}; do
+        if command -v snap >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! command -v snap >/dev/null 2>&1; then
+        err "snap 命令不可用，无法自动安装 LXD"
+    fi
+
+    if ! snap list lxd >/dev/null 2>&1; then
+        snap install lxd >/dev/null 2>&1 || err "LXD 安装失败"
+    else
+        ok "LXD snap 已安装"
+    fi
+
+    if [ -x /snap/bin/lxc ]; then
+        ln -sf /snap/bin/lxc /usr/local/bin/lxc
+    fi
+    hash -r 2>/dev/null || true
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^snap.lxd.daemon.service'; then
+        systemctl enable --now snap.lxd.daemon.service >/dev/null 2>&1 || true
+    fi
+
+    if ! lxc list >/dev/null 2>&1; then
+        info "初始化 LXD..."
+        if [ -x /snap/bin/lxd ]; then
+            /snap/bin/lxd init --auto >/dev/null 2>&1 || true
+        elif command -v lxd >/dev/null 2>&1; then
+            lxd init --auto >/dev/null 2>&1 || true
+        fi
+    fi
+
+    for _ in {1..20}; do
+        if lxc list >/dev/null 2>&1; then
+            ok "LXD/lxc 已就绪"
+            return 0
+        fi
+        sleep 1
+    done
+
+    err "LXD/lxc 未就绪，WHMCS API 将无法获取服务器列表，请先确认 lxc list 可以正常执行"
 }
 
 check_environment() {
@@ -186,6 +273,7 @@ download_latest() {
 start_service() {
     info "启动 $SERVICE_NAME 服务..."
 
+    ensure_lxd
     systemctl daemon-reload
     systemctl start "$SERVICE_NAME"
 
