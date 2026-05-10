@@ -42,7 +42,7 @@ find_bin() {
         return 0
     fi
 
-    for path in "/usr/bin/$name" "/bin/$name" "/usr/local/bin/$name"; do
+    for path in "/usr/bin/$name" "/bin/$name" "/usr/local/bin/$name" "/snap/bin/$name"; do
         if [ -x "$path" ]; then
             echo "$path"
             return 0
@@ -90,16 +90,107 @@ download_file() {
     return 127
 }
 
+ensure_lxd() {
+    info "检查 LXD/lxc 环境..."
+
+    if [ -x /snap/bin/lxc ]; then
+        ln -sf /snap/bin/lxc /usr/local/bin/lxc
+        hash -r 2>/dev/null || true
+    fi
+
+    if command -v lxc >/dev/null 2>&1; then
+        if lxc list >/dev/null 2>&1; then
+            ok "LXD/lxc 已就绪"
+            return 0
+        fi
+        if command -v lxd >/dev/null 2>&1; then
+            info "检测到 lxc 但 LXD 未初始化，正在执行 lxd init --auto..."
+            lxd init --auto >/dev/null 2>&1 || true
+            if lxc list >/dev/null 2>&1; then
+                ok "LXD/lxc 已就绪"
+                return 0
+            fi
+        fi
+    fi
+
+    info "安装并初始化 LXD snap..."
+    if ! command -v snap >/dev/null 2>&1; then
+        apt-get update >/dev/null 2>&1 || true
+        install_package snapd
+    fi
+
+    systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+    systemctl restart snapd >/dev/null 2>&1 || true
+
+    for _ in {1..20}; do
+        if command -v snap >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! command -v snap >/dev/null 2>&1; then
+        err "snap 命令不可用，无法自动安装 LXD"
+    fi
+
+    if ! snap list lxd >/dev/null 2>&1; then
+        snap install lxd >/dev/null 2>&1 || err "LXD 安装失败"
+    else
+        ok "LXD snap 已安装"
+    fi
+
+    if [ -x /snap/bin/lxc ]; then
+        ln -sf /snap/bin/lxc /usr/local/bin/lxc
+    fi
+    hash -r 2>/dev/null || true
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^snap.lxd.daemon.service'; then
+        systemctl enable --now snap.lxd.daemon.service >/dev/null 2>&1 || true
+    fi
+
+    for _ in {1..20}; do
+        if command -v lxc >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! command -v lxc >/dev/null 2>&1; then
+        err "lxc 命令不可用，请检查 snapd/LXD 安装状态"
+    fi
+
+    if ! lxc list >/dev/null 2>&1; then
+        info "初始化 LXD..."
+        if [ -x /snap/bin/lxd ]; then
+            /snap/bin/lxd init --auto >/dev/null 2>&1 || true
+        elif command -v lxd >/dev/null 2>&1; then
+            lxd init --auto >/dev/null 2>&1 || true
+        fi
+    fi
+
+    for _ in {1..20}; do
+        if lxc list >/dev/null 2>&1; then
+            ok "LXD/lxc 已就绪"
+            return 0
+        fi
+        sleep 1
+    done
+
+    err "LXD/lxc 未就绪，WHMCS API 将无法获取服务器列表，请先确认 lxc list 可以正常执行"
+}
+
 install_base_packages() {
     info "更新软件包列表..."
     apt-get update >/dev/null 2>&1
     apt-get autoremove -y >/dev/null 2>&1
 
     info "安装基础软件包..."
-    for package_name in unzip e2fsprogs bc fdisk parted wget curl ca-certificates openssl tar; do
+    for package_name in unzip e2fsprogs bc fdisk parted wget curl ca-certificates openssl tar snapd; do
         install_package "$package_name"
     done
     ok "软件包安装完成"
+
+    ensure_lxd
 }
 
 deploy_lxdapi() {
@@ -187,10 +278,11 @@ configure_lxdapi() {
         ok "nginx 已安装并启动"
         nginx_enabled_value="true"
 
-        reading "是否启用 ACME 证书插件？ y/n [y]：" acme_enabled
-        acme_enabled=${acme_enabled:-y}
+        reading "是否启用 ACME 证书插件？IP/WHMCS 推荐关闭 y/n [n]：" acme_enabled
+        acme_enabled=${acme_enabled:-n}
         if [[ "$acme_enabled" =~ ^[yY]$ ]]; then
             acme_enabled_value="true"
+            warn "ACME 需要域名和 80 端口可访问，使用纯 IP 时容易签发失败"
         else
             acme_enabled_value="false"
         fi
@@ -235,8 +327,25 @@ configure_lxdapi() {
     ok "配置文件已更新 (已固定 SQLite & Memory 模式)"
 }
 
+open_firewall_port() {
+    local port="$1"
+    [ -z "$port" ] && return 0
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+        ufw allow "${port}/tcp" >/dev/null 2>&1 && ok "ufw 已放行 TCP $port" || warn "ufw 放行 TCP $port 失败"
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        ok "firewalld 已放行 TCP $port"
+    fi
+}
+
 setup_lxdapi_service() {
     info "配置 lxdapi 系统服务..."
+
+    ensure_lxd
 
     config_file="/opt/lxdapi/configs/config.yaml"
     if [ ! -f "$config_file" ]; then
@@ -265,8 +374,8 @@ setup_lxdapi_service() {
     cat > "$service_file" << EOF
 [Unit]
 Description=LXD API Server
-After=network.target lxd.service
-Wants=lxd.service
+After=network-online.target lxd.service snap.lxd.daemon.service
+Wants=network-online.target snap.lxd.daemon.service
 
 [Service]
 Type=simple
@@ -288,6 +397,7 @@ EOF
     systemctl daemon-reload
     systemctl enable lxdapi
     systemctl start lxdapi
+    open_firewall_port "$server_port"
 
     info "等待服务启动..."
     for i in {1..10}; do
@@ -312,12 +422,12 @@ main() {
     echo "========================================"
     echo
 
-    echo "======== 步骤 1/5: 基础软件包安装 ========"
-    reading "是否安装基础软件包？(y/n) [y]：" step1_confirm
+    echo "======== 步骤 1/5: 基础软件包和 LXD 环境安装 ========"
+    reading "是否安装基础软件包并初始化 LXD？(y/n) [y]：" step1_confirm
     step1_confirm=${step1_confirm:-y}
     if [[ "$step1_confirm" =~ ^[yY]$ ]]; then
         install_base_packages
-        ok "基础软件包安装完成"
+        ok "基础软件包和 LXD 环境安装完成"
     else
         info "已跳过基础软件包安装"
     fi
@@ -369,6 +479,7 @@ main() {
     info "任务队列: Memory"
     info "数据库类型: SQLite"
     info "流量采集间隔: ${traffic_interval}s"
+    info "WHMCS API测试: curl -k -H \"X-API-Hash: $api_hash\" https://127.0.0.1:${server_port}/api/system/containers"
     echo
     systemctl status lxdapi --no-pager | head -5
 }
