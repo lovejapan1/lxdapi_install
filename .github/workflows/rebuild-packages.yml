@@ -42,7 +42,7 @@ jobs:
           }
 
           // Keep API routes and business strings untouched for WHMCS compatibility.
-          // Patch only branding, attribution, and default display titles.
+          // Patch only branding, attribution, project links, and display titles.
           const replacementSpecs = [
             ['https://github.com/xkatld/lxdapi-web-server', 'https://github.com/lovejapan1/lxdapi'],
             ['https://github.com/      /lxdapi-web-server', 'https://github.com/lovejapan1/lxdapi'],
@@ -50,12 +50,14 @@ jobs:
             ['Github-xkatld', 'Sakura'],
             ['github-xkatld', 'sakura'],
             ['xkatld', 'Sakura'],
+            ['LXD容器管理系统', 'Sakura管理系统'],
             ['LXD API 容器管理平台', 'Sakura 管理平台'],
             ['LXD API       管理平台', 'Sakura 管理平台'],
             ['LXD API 管理平台', 'Sakura 管理平台'],
             ['LXD API - 管理后台', 'Sakura - 管理后台'],
             ['LXD API - 用户中心', 'Sakura - 用户中心'],
             ['LXD API 管理', 'Sakura 管理'],
+            ['LXD API', 'Sakura '],
           ];
 
           const replacements = replacementSpecs.map(([from, to]) => {
@@ -70,11 +72,13 @@ jobs:
             'https://github.com/xkatld/lxdapi-web-server',
             'https://github.com/      /lxdapi-web-server',
             'https://github.com/Sakura/lxdapi-web-server',
+            'LXD容器管理系统',
             'LXD API 容器管理平台',
             'LXD API       管理平台',
             'LXD API 管理平台',
             'LXD API - 管理后台',
             'LXD API - 用户中心',
+            'LXD API',
           ];
           const forbidden = forbiddenSpecs.map((s) => ({ label: s, bytes: Buffer.from(s, 'utf8') }));
 
@@ -159,6 +163,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No package changes to commit"
           else
-            git commit -m "Update WHMCS-safe patched lxdapi packages"
+            git commit -m "Update WHMCS-safe Sakura patched packages"
             git push
           fi
