@@ -83,6 +83,7 @@ download_file() {
 
 run_remote_script() {
     local name="$1"
+    shift || true
     local url="${BASE_URL}/${name}"
     local tmp
     tmp=$(mktemp)
@@ -94,7 +95,7 @@ run_remote_script() {
     fi
 
     chmod +x "$tmp"
-    bash "$tmp"
+    bash "$tmp" "$@"
     local rc=$?
     rm -f "$tmp"
     return $rc
@@ -115,6 +116,7 @@ show_menu() {
     echo "4. 导入 LXD 镜像"
     echo "5. 更新 Sakura 面板"
     echo "6. 卸载 Sakura 面板"
+    echo "7. 修复运行环境（清理残留服务器 / 关闭 ACME）"
     echo "0. 退出"
     echo
 }
@@ -150,6 +152,19 @@ uninstall_panel_only() {
     run_remote_script "lxdapi_uninstall.sh" || err "面板卸载失败"
 }
 
+repair_runtime() {
+    local instance_name="${1:-}"
+    if [ -z "$instance_name" ]; then
+        reading "请输入要清理的残留服务器名，留空只修复 ACME 和服务状态：" instance_name
+    fi
+
+    if [ -n "$instance_name" ]; then
+        warn "将检查并删除 LXD 中名为 ${instance_name} 的残留实例。"
+    fi
+
+    run_remote_script "fix_lxdapi_runtime.sh" "$instance_name" || err "运行环境修复失败"
+}
+
 print_urls() {
     echo
     info "后台登录地址: https://服务器IP:8443/admin/login"
@@ -158,6 +173,7 @@ print_urls() {
 
 run_choice() {
     local choice="$1"
+    shift || true
     case "$choice" in
         1|install|all)
             run_full_install
@@ -177,6 +193,9 @@ run_choice() {
         6|uninstall|remove)
             uninstall_panel_only
             ;;
+        7|repair|fix)
+            repair_runtime "${1:-}"
+            ;;
         0|exit|quit)
             info "已退出"
             exit 0
@@ -193,12 +212,12 @@ main() {
     show_header
 
     if [ -n "${1:-}" ]; then
-        run_choice "$1"
+        run_choice "$@"
         exit 0
     fi
 
     show_menu
-    reading "请选择 [1-6]，默认一键完整安装 [1]：" choice
+    reading "请选择 [1-7]，默认一键完整安装 [1]：" choice
     choice=${choice:-1}
     run_choice "$choice"
 }
