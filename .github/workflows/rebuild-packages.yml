@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Rebuild patched packages
         shell: bash
@@ -164,5 +166,6 @@ jobs:
             echo "No package changes to commit"
           else
             git commit -m "Update WHMCS-safe Sakura patched packages"
+            git pull --rebase origin main
             git push
           fi
