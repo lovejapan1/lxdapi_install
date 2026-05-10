@@ -110,13 +110,57 @@ ensure_lxc_path() {
     fi
 }
 
+ensure_lxd_internal_ipv4() {
+    ensure_lxc_path
+    command -v lxc >/dev/null 2>&1 || return 0
+
+    if ! lxc list >/dev/null 2>&1; then
+        warn "LXD 暂未就绪，跳过内网 IPv4 修复"
+        return 0
+    fi
+
+    if ! lxc network show lxdbr0 >/dev/null 2>&1; then
+        info "创建 LXD 内网桥 lxdbr0..."
+        lxc network create lxdbr0 ipv4.address=auto ipv4.nat=true ipv6.address=none >/dev/null 2>&1 || \
+        lxc network create lxdbr0 ipv4.address=10.10.10.1/24 ipv4.nat=true ipv6.address=none >/dev/null 2>&1 || \
+        err "创建 lxdbr0 失败"
+    fi
+
+    local ipv4_addr
+    ipv4_addr=$(lxc network get lxdbr0 ipv4.address 2>/dev/null || true)
+    if [ -z "$ipv4_addr" ] || [ "$ipv4_addr" = "none" ]; then
+        lxc network set lxdbr0 ipv4.address auto >/dev/null 2>&1 || \
+        lxc network set lxdbr0 ipv4.address 10.10.10.1/24 >/dev/null 2>&1 || \
+        err "设置 lxdbr0 IPv4 地址失败"
+    fi
+
+    lxc network set lxdbr0 ipv4.dhcp true >/dev/null 2>&1 || true
+    lxc network set lxdbr0 ipv4.nat true >/dev/null 2>&1 || true
+
+    if lxc profile device show default 2>/dev/null | grep -q '^eth0:'; then
+        lxc profile device set default eth0 network lxdbr0 >/dev/null 2>&1 || {
+            lxc profile device remove default eth0 >/dev/null 2>&1 || true
+            lxc profile device add default eth0 nic network=lxdbr0 name=eth0 >/dev/null 2>&1 || err "配置 default profile eth0 失败"
+        }
+        lxc profile device set default eth0 name eth0 >/dev/null 2>&1 || true
+    else
+        lxc profile device add default eth0 nic network=lxdbr0 name=eth0 >/dev/null 2>&1 || err "添加 default profile eth0 失败"
+    fi
+
+    if lxc storage show default >/dev/null 2>&1 && ! lxc profile device show default 2>/dev/null | grep -q '^root:'; then
+        lxc profile device add default root disk path=/ pool=default >/dev/null 2>&1 || true
+    fi
+
+    ok "LXD 内网 IPv4 已启用，后续新服务器会从 lxdbr0 获取内网 IP"
+}
+
 list_lxd_instances() {
     command -v lxc >/dev/null 2>&1 || return 0
     lxc list --format csv -c n 2>/dev/null | sed '/^[[:space:]]*$/d' || true
 }
 
 offer_cleanup_existing_lxd_instances() {
-    ensure_lxc_path
+    ensure_lxd_internal_ipv4
     command -v lxc >/dev/null 2>&1 || return 0
 
     local names
@@ -211,8 +255,8 @@ restart_lxdapi_after_install() {
 }
 
 post_panel_install_fix() {
-    info "执行安装后修复：lxc 路径、ACME、服务状态..."
-    ensure_lxc_path
+    info "执行安装后修复：lxc 路径、LXD 内网 IPv4、ACME、服务状态..."
+    ensure_lxd_internal_ipv4
     disable_lxdapi_acme
     restart_lxdapi_after_install
 }
@@ -248,6 +292,7 @@ run_full_install() {
 
 install_lxd_only() {
     run_remote_script "lxd_install.sh" || err "LXD 安装失败"
+    ensure_lxd_internal_ipv4
     offer_cleanup_existing_lxd_instances
 }
 
