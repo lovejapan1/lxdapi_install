@@ -4,6 +4,10 @@ Sakura 定制版 LXDAPI 安装仓库，支持 Debian/Ubuntu。
 
 面板界面显示为 `服务器`，但 WHMCS 对接接口保持不变，API 路径仍然是 `/api/system/containers`，不要改这个接口路径。
 
+```text
+WHMCS对接插件上传目录/modules/servers
+```
+
 ## 后台登录地址
 
 安装完成后访问：
