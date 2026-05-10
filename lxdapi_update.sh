@@ -192,6 +192,8 @@ get_latest_version() {
 stop_service() {
     info "停止 $SERVICE_NAME 服务..."
 
+    pkill -f "acme.sh --issue" >/dev/null 2>&1 || true
+
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         systemctl stop "$SERVICE_NAME"
         sleep 2
@@ -230,6 +232,28 @@ backup_files() {
         cp "$INSTALL_DIR/lxdapi.db" "$BACKUP_PATH/lxdapi.db"
         ok "数据库文件已备份"
     fi
+}
+
+disable_acme() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        warn "配置文件不存在，跳过 ACME 修复: $CONFIG_FILE"
+        return 0
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp)
+    awk '
+        /^  acme:/ { in_acme=1; print; next }
+        in_acme && /^  [^[:space:]]/ { in_acme=0 }
+        in_acme && /^[[:space:]]*enabled:[[:space:]]*/ {
+            sub(/enabled:[[:space:]]*.*/, "enabled: false")
+        }
+        { print }
+    ' "$CONFIG_FILE" > "$tmp_file" || err "生成新配置失败"
+
+    mv "$tmp_file" "$CONFIG_FILE" || err "写入配置失败"
+    pkill -f "acme.sh --issue" >/dev/null 2>&1 || true
+    ok "已关闭 ACME 插件，避免 IP 证书签发导致服务卡住"
 }
 
 download_latest() {
@@ -351,6 +375,7 @@ main() {
     backup_files
 
     if download_latest; then
+        disable_acme
         start_service
         show_result
     else
