@@ -41,6 +41,8 @@ jobs:
             return Buffer.concat([raw, Buffer.alloc(length - raw.length, 0x20)]);
           }
 
+          // Keep API routes and business strings untouched for WHMCS compatibility.
+          // Patch only branding, attribution, and default display titles.
           const replacementSpecs = [
             ['https://github.com/xkatld/lxdapi-web-server', 'https://github.com/lovejapan1/lxdapi'],
             ['https://github.com/      /lxdapi-web-server', 'https://github.com/lovejapan1/lxdapi'],
@@ -48,85 +50,12 @@ jobs:
             ['Github-xkatld', 'Sakura'],
             ['github-xkatld', 'sakura'],
             ['xkatld', 'Sakura'],
-
-            ['LXD API 容器管理平台', 'Sakura 服务器'],
-            ['LXD API       管理平台', 'Sakura 服务器'],
-            ['LXD API 管理平台', 'Sakura'],
-            ['LXD API - 容器控制', 'Sakura - 服务器'],
+            ['LXD API 容器管理平台', 'Sakura 管理平台'],
+            ['LXD API       管理平台', 'Sakura 管理平台'],
+            ['LXD API 管理平台', 'Sakura 管理平台'],
             ['LXD API - 管理后台', 'Sakura - 管理后台'],
             ['LXD API - 用户中心', 'Sakura - 用户中心'],
-            ['LXD API 管理', 'Sakura'],
-
-            ['用户中心 - LXD容器管理系统', '用户中心 - Sakura服务器'],
-            ['管理后台 - LXD容器管理系统', '管理后台 - Sakura服务器'],
-            ['容器管理 - LXD容器管理系统', '服务器 - Sakura'],
-            ['LXD容器管理系统', 'Sakura服务器'],
-            ['容器管理平台', '服务器'],
-            ['容器管理系统', '服务器'],
-            ['容器控制面板', '服务器面板'],
-            ['容器控制', '服务器'],
-            ['容器登录', '服务器'],
-            ['我的容器', '服务器'],
-            ['容器详情', '服务器'],
-            ['容器名称', '服务器'],
-            ['容器列表', '服务器'],
-            ['容器信息', '服务器'],
-            ['容器凭证', '服务器'],
-            ['容器不存在', '服务器'],
-            ['容器已存在', '服务器'],
-            ['无权操作该容器', '无权操作服务器'],
-            ['无权访问该容器', '无权访问服务器'],
-            ['无权访问此容器', '无权访问服务器'],
-            ['无权操作此容器', '无权操作服务器'],
-            ['缺少容器名称', '缺少服务器'],
-            ['缺少容器凭证', '缺少服务器'],
-            ['容器未配置内网IP', '服务器未配置IP'],
-            ['容器内网IPv4', '服务器IPv4'],
-            ['容器内网IPv6', '服务器IPv6'],
-            ['容器MAC地址', '服务器MAC'],
-            ['无效的容器Hash', '无效服务器'],
-            ['容器级认证失败', '服务器认证失败'],
-            ['容器流量已重置', '服务器流量重置'],
-            ['容器密码重置成功', '服务器密码重置'],
-            ['容器网络信息不可用', '服务器网络不可用'],
-
-            ['启动容器: %s', '启动服务器'],
-            ['停止容器: %s', '停止服务器'],
-            ['重启容器: %s', '重启服务器'],
-            ['暂停容器: %s', '暂停服务器'],
-            ['恢复容器: %s', '恢复服务器'],
-            ['删除容器: %s', '删除服务器'],
-            ['启动容器失败', '启动服务器'],
-            ['停止容器失败', '停止服务器'],
-            ['重启容器失败', '重启服务器'],
-            ['暂停容器失败', '暂停服务器'],
-            ['恢复容器失败', '恢复服务器'],
-            ['创建容器失败', '创建服务器'],
-            ['删除容器失败', '删除服务器'],
-            ['重装容器失败', '重装服务器'],
-            ['查询容器失败', '查询服务器'],
-            ['获取容器失败', '获取服务器'],
-            ['获取容器信息失败', '获取服务器信息'],
-            ['获取容器列表失败', '获取服务器列表'],
-            ['创建容器任务失败', '创建服务器任务'],
-            ['容器启动成功', '服务器启动'],
-            ['容器停止成功', '服务器停止'],
-            ['容器重启成功', '服务器重启'],
-            ['容器暂停成功', '服务器暂停'],
-            ['容器恢复成功', '服务器恢复'],
-            ['容器创建成功', '服务器创建'],
-            ['容器删除成功', '服务器删除'],
-            ['容器重装成功', '服务器重装'],
-            ['容器初始化成功', '服务器初始化'],
-            ['更新容器配置', '更新服务器'],
-            ['开始重装容器', '重装服务器'],
-            ['容器: %s, 操作: %s', '服务器操作'],
-            ['容器: %s', '服务器'],
-            ['容器 %s', '服务器'],
-            ['(容器: %s)', '服务器'],
-
-            ['LXD API', 'Sakura '],
-            ['容器', '服务'],
+            ['LXD API 管理', 'Sakura 管理'],
           ];
 
           const replacements = replacementSpecs.map(([from, to]) => {
@@ -135,21 +64,17 @@ jobs:
           });
 
           const forbiddenSpecs = [
-            'LXD API 容器管理平台',
-            'LXD API       管理平台',
-            'LXD API 管理平台',
-            'LXD API - 容器控制',
-            'LXD API - 管理后台',
-            'LXD API - 用户中心',
-            'LXD API 管理',
-            'LXD API',
-            '容器',
-            'xkatld',
             'Github-xkatld',
             'github-xkatld',
+            'xkatld',
             'https://github.com/xkatld/lxdapi-web-server',
             'https://github.com/      /lxdapi-web-server',
             'https://github.com/Sakura/lxdapi-web-server',
+            'LXD API 容器管理平台',
+            'LXD API       管理平台',
+            'LXD API 管理平台',
+            'LXD API - 管理后台',
+            'LXD API - 用户中心',
           ];
           const forbidden = forbiddenSpecs.map((s) => ({ label: s, bytes: Buffer.from(s, 'utf8') }));
 
@@ -213,8 +138,8 @@ jobs:
             if (rebuilt.indexOf(Buffer.from('Sakura', 'utf8')) === -1) {
               throw new Error(`${job.output} does not contain Sakura`);
             }
-            if (rebuilt.indexOf(Buffer.from('服务器', 'utf8')) === -1) {
-              throw new Error(`${job.output} does not contain 服务器`);
+            if (rebuilt.indexOf(Buffer.from('/api/system/containers', 'utf8')) === -1) {
+              throw new Error(`${job.output} lost WHMCS container API route`);
             }
 
             console.log(`${job.output} rebuilt`);
@@ -234,6 +159,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No package changes to commit"
           else
-            git commit -m "Update patched lxdapi packages"
+            git commit -m "Update WHMCS-safe patched lxdapi packages"
             git push
           fi
