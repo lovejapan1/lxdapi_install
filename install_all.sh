@@ -17,6 +17,12 @@ warn() { log "${YELLOW}[WARN]${NC} $1"; }
 err() { log "${RED}[ERR]${NC} $1"; exit 1; }
 reading() { read -rp "$(echo -e "${GREEN}$1${NC}")" "$2"; }
 
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        err "请使用 root 用户运行"
+    fi
+}
+
 find_bin() {
     local name="$1"
     if command -v "$name" >/dev/null 2>&1; then
@@ -35,13 +41,22 @@ find_bin() {
 }
 
 install_downloader() {
-    if [ "$(id -u)" -ne 0 ]; then
-        err "请使用 root 用户运行"
-    fi
-
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update >/dev/null 2>&1 || true
         apt-get install -y curl wget ca-certificates >/dev/null 2>&1 || true
+    fi
+}
+
+ensure_downloader() {
+    if find_bin curl >/dev/null 2>&1 || find_bin wget >/dev/null 2>&1; then
+        return 0
+    fi
+
+    info "未找到 curl/wget，正在安装下载工具..."
+    install_downloader
+
+    if ! find_bin curl >/dev/null 2>&1 && ! find_bin wget >/dev/null 2>&1; then
+        err "无法安装 curl/wget，请先手动安装下载工具"
     fi
 }
 
@@ -85,53 +100,107 @@ run_remote_script() {
     return $rc
 }
 
-main() {
+show_header() {
     echo
     echo "========================================"
-    echo "        Sakura 一键安装脚本"
+    echo "        Sakura 安装管理脚本"
     echo "========================================"
     echo
-    echo "1. 安装并配置 LXD"
-    echo "2. 安装 Sakura 面板"
-    echo "3. 导入 LXD 镜像"
-    echo
+}
 
-    if ! find_bin curl >/dev/null 2>&1 && ! find_bin wget >/dev/null 2>&1; then
-        info "未找到 curl/wget，正在安装下载工具..."
-        install_downloader
-    fi
-
-    reading "是否安装并配置 LXD？(y/n) [y]：" install_lxd_confirm
-    install_lxd_confirm=${install_lxd_confirm:-y}
-    if [[ "$install_lxd_confirm" =~ ^[yY]$ ]]; then
-        run_remote_script "lxd_install.sh" || err "LXD 安装失败"
-    else
-        warn "已跳过 LXD 安装"
-    fi
-
+show_menu() {
+    echo "1. 一键完整安装（LXD + Sakura 面板 + 导入镜像）"
+    echo "2. 只安装/配置 LXD"
+    echo "3. 只安装 Sakura 面板"
+    echo "4. 导入 LXD 镜像"
+    echo "5. 更新 Sakura 面板"
+    echo "6. 卸载 Sakura 面板"
+    echo "0. 退出"
     echo
-    reading "是否安装 Sakura 面板？(y/n) [y]：" install_panel_confirm
-    install_panel_confirm=${install_panel_confirm:-y}
-    if [[ "$install_panel_confirm" =~ ^[yY]$ ]]; then
-        run_remote_script "lxdapi_install.sh" || err "面板安装失败"
-    else
-        warn "已跳过面板安装"
-    fi
+}
 
-    echo
-    reading "是否导入镜像？(y/n) [y]：" import_image_confirm
-    import_image_confirm=${import_image_confirm:-y}
-    if [[ "$import_image_confirm" =~ ^[yY]$ ]]; then
-        run_remote_script "image_import.sh" || err "镜像导入脚本执行失败"
-    else
-        warn "已跳过镜像导入"
-    fi
+run_full_install() {
+    run_remote_script "lxd_install.sh" || err "LXD 安装失败"
+    run_remote_script "lxdapi_install.sh" || err "面板安装失败"
+    run_remote_script "image_import.sh" || err "镜像导入脚本执行失败"
+    ok "一键完整安装流程执行完成"
+    print_urls
+}
 
+install_lxd_only() {
+    run_remote_script "lxd_install.sh" || err "LXD 安装失败"
+}
+
+install_panel_only() {
+    run_remote_script "lxdapi_install.sh" || err "面板安装失败"
+    print_urls
+}
+
+import_images_only() {
+    run_remote_script "image_import.sh" || err "镜像导入脚本执行失败"
+}
+
+update_panel_only() {
+    run_remote_script "lxdapi_update.sh" || err "面板更新失败"
+    print_urls
+}
+
+uninstall_panel_only() {
+    warn "卸载只会删除 Sakura/LXDAPI 面板，不会删除 LXD、镜像和已创建的服务器。"
+    run_remote_script "lxdapi_uninstall.sh" || err "面板卸载失败"
+}
+
+print_urls() {
     echo
-    ok "一键流程执行完成"
-    echo
-    info "面板地址: https://服务器IP:8443/admin/login"
+    info "后台登录地址: https://服务器IP:8443/admin/login"
     info "WHMCS API: https://服务器IP:8443/api/system/containers"
+}
+
+run_choice() {
+    local choice="$1"
+    case "$choice" in
+        1|install|all)
+            run_full_install
+            ;;
+        2|lxd)
+            install_lxd_only
+            ;;
+        3|panel|install-panel)
+            install_panel_only
+            ;;
+        4|image|images|import)
+            import_images_only
+            ;;
+        5|update)
+            update_panel_only
+            ;;
+        6|uninstall|remove)
+            uninstall_panel_only
+            ;;
+        0|exit|quit)
+            info "已退出"
+            exit 0
+            ;;
+        *)
+            err "无效选择: $choice"
+            ;;
+    esac
+}
+
+main() {
+    require_root
+    ensure_downloader
+    show_header
+
+    if [ -n "${1:-}" ]; then
+        run_choice "$1"
+        exit 0
+    fi
+
+    show_menu
+    reading "请选择 [1-6]，默认一键完整安装 [1]：" choice
+    choice=${choice:-1}
+    run_choice "$choice"
 }
 
 main "$@"
