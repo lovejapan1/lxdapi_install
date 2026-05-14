@@ -130,6 +130,76 @@ ensure_lxd_internal_ipv4() {
     ok "LXD 内网 IPv4 已处理"
 }
 
+ensure_host_lxd_nat() {
+    if ! command -v ip >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
+        warn "缺少 ip 或 iptables，跳过宿主机 LXD 出口 NAT 兜底"
+        return 0
+    fi
+
+    local public_if=""
+    local lxd_cidr=""
+    public_if="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    lxd_cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
+
+    if [ -z "${public_if}" ]; then
+        warn "未检测到公网出口网卡，请检查默认路由"
+        return 0
+    fi
+
+    if [ -z "${lxd_cidr}" ]; then
+        warn "lxdbr0 没有 IPv4 地址，跳过 LXD 出口 NAT 兜底"
+        return 0
+    fi
+
+    info "检测到公网出口网卡: ${public_if}"
+    info "面板 IPv4 NAT 配置里的网卡接口也应填写: ${public_if}"
+
+    iptables -t nat -C POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || \
+        iptables -t nat -A POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || true
+    iptables -C FORWARD -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -I FORWARD 1 -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || true
+    iptables -C FORWARD -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || \
+        iptables -I FORWARD 1 -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+
+    mkdir -p /usr/local/sbin
+    cat >/usr/local/sbin/sakura-lxdapi-nat.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+command -v ip >/dev/null 2>&1 || exit 0
+command -v iptables >/dev/null 2>&1 || exit 0
+PUB_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+LXD_CIDR="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
+[ -n "${PUB_IF}" ] || exit 0
+[ -n "${LXD_CIDR}" ] || exit 0
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+iptables -t nat -C POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || true
+iptables -C FORWARD -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || iptables -I FORWARD 1 -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || true
+iptables -C FORWARD -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || iptables -I FORWARD 1 -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+EOF
+    chmod +x /usr/local/sbin/sakura-lxdapi-nat.sh
+
+    if command -v systemctl >/dev/null 2>&1; then
+        cat >/etc/systemd/system/sakura-lxdapi-nat.service <<'EOF'
+[Unit]
+Description=Sakura LXDAPI LXD NAT fallback
+After=network-online.target snap.lxd.daemon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sakura-lxdapi-nat.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now sakura-lxdapi-nat.service >/dev/null 2>&1 || true
+    fi
+
+    ok "LXD 出口 NAT 已处理"
+}
+
 patch_panel_binary_words() {
     if [ ! -d /opt/lxdapi ]; then
         return 0
@@ -239,8 +309,9 @@ restart_lxdapi_after_install() {
 
 post_panel_install_fix() {
     ensure_lxc_path
-    ensure_port_forwarding_runtime
     ensure_lxd_internal_ipv4
+    ensure_port_forwarding_runtime
+    ensure_host_lxd_nat
     patch_panel_binary_words
     cleanup_unused_runtime_files
     disable_lxdapi_acme
@@ -280,8 +351,9 @@ offer_cleanup_existing_lxd_instances() {
 
 install_lxd_only() {
     run_remote_script "lxd_install.sh"
-    ensure_port_forwarding_runtime
     ensure_lxd_internal_ipv4
+    ensure_port_forwarding_runtime
+    ensure_host_lxd_nat
     cleanup_unused_runtime_files
     offer_cleanup_existing_lxd_instances
 }
