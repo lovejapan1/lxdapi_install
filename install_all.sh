@@ -49,6 +49,36 @@ ensure_lxc_path() {
     fi
 }
 
+apply_base_firewall_rules() {
+    local ipt=""
+    for ipt in iptables iptables-legacy; do
+        command -v "${ipt}" >/dev/null 2>&1 || continue
+        "${ipt}" -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I INPUT 1 -i lo -j ACCEPT >/dev/null 2>&1 || true
+        "${ipt}" -C OUTPUT -o lo -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I OUTPUT 1 -o lo -j ACCEPT >/dev/null 2>&1 || true
+        "${ipt}" -C INPUT -p tcp --dport 8443 -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I INPUT 1 -p tcp --dport 8443 -j ACCEPT >/dev/null 2>&1 || true
+        "${ipt}" -C FORWARD -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I FORWARD 1 -j ACCEPT >/dev/null 2>&1 || true
+    done
+}
+
+apply_lxd_nat_rules() {
+    local public_if="$1"
+    local lxd_cidr="$2"
+    local ipt=""
+
+    [ -n "${public_if}" ] || return 0
+    [ -n "${lxd_cidr}" ] || return 0
+
+    for ipt in iptables iptables-legacy; do
+        command -v "${ipt}" >/dev/null 2>&1 || continue
+        "${ipt}" -t nat -C POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || \
+            "${ipt}" -t nat -A POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || true
+        "${ipt}" -C FORWARD -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || \
+            "${ipt}" -I FORWARD 1 -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || true
+        "${ipt}" -C FORWARD -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || \
+            "${ipt}" -I FORWARD 1 -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+    done
+}
+
 ensure_port_forwarding_runtime() {
     info "检查端口转发运行环境..."
 
@@ -77,13 +107,7 @@ EOF
         systemctl enable --now nftables >/dev/null 2>&1 || true
     fi
 
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT 1 -i lo -j ACCEPT >/dev/null 2>&1 || true
-        iptables -C OUTPUT -o lo -j ACCEPT >/dev/null 2>&1 || iptables -I OUTPUT 1 -o lo -j ACCEPT >/dev/null 2>&1 || true
-        iptables -C INPUT -p tcp --dport 8443 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT 1 -p tcp --dport 8443 -j ACCEPT >/dev/null 2>&1 || true
-        iptables -C FORWARD -j ACCEPT >/dev/null 2>&1 || iptables -I FORWARD 1 -j ACCEPT >/dev/null 2>&1 || true
-    fi
-
+    apply_base_firewall_rules
     ok "端口转发运行环境已处理"
 }
 
@@ -131,8 +155,8 @@ ensure_lxd_internal_ipv4() {
 }
 
 ensure_host_lxd_nat() {
-    if ! command -v ip >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
-        warn "缺少 ip 或 iptables，跳过宿主机 LXD 出口 NAT 兜底"
+    if ! command -v ip >/dev/null 2>&1; then
+        warn "缺少 ip 命令，跳过宿主机 LXD 出口 NAT 兜底"
         return 0
     fi
 
@@ -154,27 +178,24 @@ ensure_host_lxd_nat() {
     info "检测到公网出口网卡: ${public_if}"
     info "面板 IPv4 NAT 配置里的网卡接口也应填写: ${public_if}"
 
-    iptables -t nat -C POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || \
-        iptables -t nat -A POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || true
-    iptables -C FORWARD -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || \
-        iptables -I FORWARD 1 -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || true
-    iptables -C FORWARD -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || \
-        iptables -I FORWARD 1 -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+    apply_lxd_nat_rules "${public_if}" "${lxd_cidr}"
 
     mkdir -p /usr/local/sbin
     cat >/usr/local/sbin/sakura-lxdapi-nat.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 command -v ip >/dev/null 2>&1 || exit 0
-command -v iptables >/dev/null 2>&1 || exit 0
 PUB_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 LXD_CIDR="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
 [ -n "${PUB_IF}" ] || exit 0
 [ -n "${LXD_CIDR}" ] || exit 0
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-iptables -t nat -C POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || true
-iptables -C FORWARD -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || iptables -I FORWARD 1 -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || true
-iptables -C FORWARD -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || iptables -I FORWARD 1 -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+for IPT in iptables iptables-legacy; do
+    command -v "${IPT}" >/dev/null 2>&1 || continue
+    "${IPT}" -t nat -C POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || "${IPT}" -t nat -A POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || true
+    "${IPT}" -C FORWARD -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || "${IPT}" -I FORWARD 1 -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || true
+    "${IPT}" -C FORWARD -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || "${IPT}" -I FORWARD 1 -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+done
 EOF
     chmod +x /usr/local/sbin/sakura-lxdapi-nat.sh
 
