@@ -155,11 +155,32 @@ patch_panel_binary_words() {
     info "修复面板残留文字..."
     while IFS= read -r bin; do
         [ -n "${bin}" ] || continue
-        cp -a "${bin}" "${bin}.bak_words" 2>/dev/null || true
-        perl -0pi -e 's/容器端口/服务端口/g; s/容器列表/服务列表/g; s/容器管理/服务管理/g; s/容器名称/服务名称/g; s/容器密码/服务密码/g; s/容器信息/服务信息/g; s/容器状态/服务状态/g; s/容器类型/服务类型/g; s/容器IP/服务IP/g; s/添加容器/添加服务/g; s/创建容器/创建服务/g; s/删除容器/删除服务/g; s/暂无容器/暂无服务/g;' "${bin}" 2>/dev/null || cp -a "${bin}.bak_words" "${bin}" 2>/dev/null || true
+        local backup="${bin}.bak_words"
+        cp -a "${bin}" "${backup}" 2>/dev/null || true
+        if perl -0pi -e 's/容器端口/服务端口/g; s/容器列表/服务列表/g; s/容器管理/服务管理/g; s/容器名称/服务名称/g; s/容器密码/服务密码/g; s/容器信息/服务信息/g; s/容器状态/服务状态/g; s/容器类型/服务类型/g; s/容器IP/服务IP/g; s/添加容器/添加服务/g; s/创建容器/创建服务/g; s/删除容器/删除服务/g; s/暂无容器/暂无服务/g;' "${bin}" 2>/dev/null; then
+            rm -f "${backup}" 2>/dev/null || true
+        else
+            cp -a "${backup}" "${bin}" 2>/dev/null || true
+            rm -f "${backup}" 2>/dev/null || true
+        fi
         chmod +x "${bin}" 2>/dev/null || true
     done <<< "${bins}"
     ok "面板残留文字已处理"
+}
+
+cleanup_unused_runtime_files() {
+    info "清理安装缓存和临时备份..."
+    rm -f /opt/lxdapi/lxdapi-*.bak_words 2>/dev/null || true
+    rm -f /tmp/lxd_install.sh /tmp/lxdapi_install.sh /tmp/lxdapi_update.sh /tmp/image_import.sh /tmp/lxdapi_uninstall.sh 2>/dev/null || true
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get clean >/dev/null 2>&1 || true
+    fi
+
+    if [ -d /var/lib/snapd/cache ]; then
+        find /var/lib/snapd/cache -type f -delete 2>/dev/null || true
+    fi
+    ok "无用缓存已清理"
 }
 
 disable_lxdapi_acme() {
@@ -221,6 +242,7 @@ post_panel_install_fix() {
     ensure_port_forwarding_runtime
     ensure_lxd_internal_ipv4
     patch_panel_binary_words
+    cleanup_unused_runtime_files
     disable_lxdapi_acme
     restart_lxdapi_after_install
 }
@@ -260,6 +282,7 @@ install_lxd_only() {
     run_remote_script "lxd_install.sh"
     ensure_port_forwarding_runtime
     ensure_lxd_internal_ipv4
+    cleanup_unused_runtime_files
     offer_cleanup_existing_lxd_instances
 }
 
@@ -285,6 +308,7 @@ run_full_install() {
     install_lxd_only
     install_panel_only
     import_images_only
+    cleanup_unused_runtime_files
 }
 
 show_header() {
