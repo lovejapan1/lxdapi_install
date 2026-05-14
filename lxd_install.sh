@@ -15,6 +15,7 @@ CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(lsb
 SYS="${CMD[0]}"
 [[ -n $SYS ]] || exit 1
 
+SYSTEM=""
 for ((int = 0; int < ${#REGEX[@]}; int++)); do
     if [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]]; then
         SYSTEM="${RELEASE[int]}"
@@ -47,15 +48,20 @@ warn() { log "${YELLOW}[WARN]${NC} $1"; }
 err() { log "${RED}[ERR]${NC} $1"; exit 1; }
 reading() { read -rp "$(echo -e "${GREEN}$1${NC}")" "$2"; }
 
+package_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
 install_package() {
     local package_name="$1"
-    if dpkg -l 2>/dev/null | grep -q "^ii.*$package_name"; then
+    if package_installed "$package_name"; then
         ok "$package_name 已安装"
         return 0
     fi
 
+    info "安装 $package_name..."
     apt-get install -y "$package_name" >/dev/null 2>&1 || apt-get install -y "$package_name" --fix-missing >/dev/null 2>&1 || true
-    if dpkg -l 2>/dev/null | grep -q "^ii.*$package_name"; then
+    if package_installed "$package_name"; then
         ok "$package_name 已安装"
     else
         warn "$package_name 安装失败"
@@ -66,9 +72,24 @@ get_available_space() {
     df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}'
 }
 
+ensure_apt_ready() {
+    local need_update=false
+    local package_name=""
+    for package_name in curl wget ca-certificates nftables snapd; do
+        package_installed "$package_name" || need_update=true
+    done
+
+    if [[ "$need_update" == "true" ]]; then
+        info "更新软件包列表..."
+        apt-get update >/dev/null 2>&1 || true
+    else
+        ok "基础组件已安装，跳过 apt update"
+    fi
+}
+
 ensure_snap_lxd() {
     info "安装基础组件..."
-    apt-get update >/dev/null 2>&1 || true
+    ensure_apt_ready
     for package_name in curl wget ca-certificates nftables snapd; do
         install_package "$package_name"
     done
@@ -78,7 +99,9 @@ ensure_snap_lxd() {
     fi
 
     systemctl enable --now snapd.socket >/dev/null 2>&1 || true
-    systemctl restart snapd >/dev/null 2>&1 || true
+    if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet snapd; then
+        systemctl start snapd >/dev/null 2>&1 || true
+    fi
 
     for _ in {1..20}; do
         command -v snap >/dev/null 2>&1 && break
@@ -89,15 +112,18 @@ ensure_snap_lxd() {
         err "snap 命令不可用，无法安装 LXD"
     fi
 
+    snap set system refresh.retain=2 >/dev/null 2>&1 || true
+
     if ! snap list lxd >/dev/null 2>&1; then
-        info "开始安装 LXD..."
-        snap install lxd --channel=latest/stable >/dev/null 2>&1 || {
+        info "开始安装 LXD，这一步受 snap 下载速度影响，可能需要几分钟..."
+        snap install lxd --channel=latest/stable || {
+            warn "首次安装 LXD 失败，尝试修复 snap core 后重试..."
             snap remove lxd >/dev/null 2>&1 || true
-            snap install core >/dev/null 2>&1 || true
-            snap install lxd --channel=latest/stable >/dev/null 2>&1 || err "LXD 安装失败"
+            snap install core || true
+            snap install lxd --channel=latest/stable || err "LXD 安装失败"
         }
     else
-        ok "LXD 已安装"
+        ok "LXD 已安装，跳过 snap install"
     fi
 
     snap alias lxd.lxc lxc >/dev/null 2>&1 || true
@@ -124,8 +150,11 @@ ensure_snap_lxd() {
 
     snap set lxd lxcfs.flags="-l" >/dev/null 2>&1 || true
     snap set lxd daemon.debug=false >/dev/null 2>&1 || true
-    snap restart lxd >/dev/null 2>&1 || true
-    sleep 3
+
+    if ! lxc list >/dev/null 2>&1; then
+        snap restart lxd >/dev/null 2>&1 || true
+        sleep 3
+    fi
 
     lxd_version=$(lxd --version 2>/dev/null || true)
     info "LXD 版本: ${lxd_version:-unknown}"
