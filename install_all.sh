@@ -156,20 +156,12 @@ detect_lxd_cidr() {
 
 collect_ifaces() {
     local public_if="${PUBLIC_INTERFACE:-}"
-    [ -n "${public_if}" ] && echo "${public_if}"
+    if [ -n "${public_if}" ] && [ "${public_if}" != "lo" ] && [ "${public_if}" != "lxdbr0" ] && ip link show "${public_if}" >/dev/null 2>&1; then
+        echo "${public_if}"
+    fi
     public_if="$(detect_public_if)"
-    [ -n "${public_if}" ] && echo "${public_if}"
-    if command -v nft >/dev/null 2>&1; then
-        nft list ruleset 2>/dev/null | awk '
-            /dnat/ && /iifname/ {
-                for (i=1; i<=NF; i++) {
-                    if ($i=="iifname") {
-                        gsub(/"/, "", $(i+1));
-                        print $(i+1);
-                    }
-                }
-            }
-        '
+    if [ -n "${public_if}" ] && [ "${public_if}" != "lo" ] && [ "${public_if}" != "lxdbr0" ] && ip link show "${public_if}" >/dev/null 2>&1; then
+        echo "${public_if}"
     fi
 }
 
@@ -197,6 +189,30 @@ add_masquerade_rule() {
     if ! nft list chain ip sakura_lxdapi_snat postrouting 2>/dev/null | grep -Fq "ip saddr ${cidr} oifname \"${iface}\" masquerade"; then
         nft add rule ip sakura_lxdapi_snat postrouting ip saddr "${cidr}" oifname "${iface}" masquerade >/dev/null 2>&1 || true
     fi
+}
+
+cleanup_stale_masquerade_rules() {
+    local cidr="$1"
+    local ipt=""
+    local iface=""
+
+    command -v nft >/dev/null 2>&1 && nft delete table ip sakura_lxdapi_snat >/dev/null 2>&1 || true
+
+    for ipt in iptables iptables-legacy; do
+        command -v "${ipt}" >/dev/null 2>&1 || continue
+        "${ipt}" -t nat -S POSTROUTING 2>/dev/null | awk -v cidr="${cidr}" '
+            $0 ~ "-s "cidr && /-j MASQUERADE/ {
+                for (i=1; i<=NF; i++) {
+                    if ($i=="-o") print $(i+1);
+                }
+            }
+        ' | awk 'NF && !seen[$0]++' | while IFS= read -r iface; do
+            [ -n "${iface}" ] || continue
+            if ! ip link show "${iface}" >/dev/null 2>&1; then
+                while "${ipt}" -t nat -D POSTROUTING -s "${cidr}" -o "${iface}" -j MASQUERADE >/dev/null 2>&1; do :; done
+            fi
+        done
+    done
 }
 
 mirror_dnat_rules() {
@@ -263,6 +279,7 @@ cidr="${LXD_CIDR:-}"
 [ -n "${cidr}" ] || cidr="$(detect_lxd_cidr)"
 
 if [ -n "${cidr}" ]; then
+    cleanup_stale_masquerade_rules "${cidr}"
     while IFS= read -r iface; do
         [ -n "${iface}" ] || continue
         [ "${iface}" = "lo" ] && continue
