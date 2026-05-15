@@ -60,6 +60,29 @@ apply_base_firewall_rules() {
     done
 }
 
+remove_stale_lxd_nat_rules() {
+    local public_if="$1"
+    local lxd_cidr="$2"
+    local ipt=""
+    local rule=""
+    local delete_rule=""
+
+    [ -n "${public_if}" ] || return 0
+    [ -n "${lxd_cidr}" ] || return 0
+
+    for ipt in iptables iptables-legacy; do
+        command -v "${ipt}" >/dev/null 2>&1 || continue
+        while IFS= read -r rule; do
+            [[ "${rule}" == *"-s ${lxd_cidr}"* ]] || continue
+            [[ "${rule}" == *"-j MASQUERADE"* ]] || continue
+            [[ "${rule}" != *"-o ${public_if}"* ]] || continue
+            delete_rule="${rule/-A POSTROUTING/-D POSTROUTING}"
+            read -r -a delete_args <<< "${delete_rule}"
+            "${ipt}" -t nat "${delete_args[@]}" >/dev/null 2>&1 || true
+        done < <("${ipt}" -t nat -S POSTROUTING 2>/dev/null || true)
+    done
+}
+
 apply_lxd_nat_rules() {
     local public_if="$1"
     local lxd_cidr="$2"
@@ -67,6 +90,8 @@ apply_lxd_nat_rules() {
 
     [ -n "${public_if}" ] || return 0
     [ -n "${lxd_cidr}" ] || return 0
+
+    remove_stale_lxd_nat_rules "${public_if}" "${lxd_cidr}"
 
     for ipt in iptables iptables-legacy; do
         command -v "${ipt}" >/dev/null 2>&1 || continue
@@ -163,7 +188,8 @@ ensure_host_lxd_nat() {
     local public_if=""
     local lxd_cidr=""
     public_if="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-    lxd_cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
+    lxd_cidr="$(ip -o -4 route show dev lxdbr0 scope link 2>/dev/null | awk '{print $1; exit}')"
+    [ -n "${lxd_cidr}" ] || lxd_cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
 
     if [ -z "${public_if}" ]; then
         warn "未检测到公网出口网卡，请检查默认路由"
@@ -176,6 +202,7 @@ ensure_host_lxd_nat() {
     fi
 
     info "检测到公网出口网卡: ${public_if}"
+    info "检测到 LXD 内网网段: ${lxd_cidr}"
     info "面板 IPv4 NAT 配置里的网卡接口也应填写: ${public_if}"
 
     apply_lxd_nat_rules "${public_if}" "${lxd_cidr}"
@@ -186,12 +213,21 @@ ensure_host_lxd_nat() {
 set -euo pipefail
 command -v ip >/dev/null 2>&1 || exit 0
 PUB_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-LXD_CIDR="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
+LXD_CIDR="$(ip -o -4 route show dev lxdbr0 scope link 2>/dev/null | awk '{print $1; exit}')"
+[ -n "${LXD_CIDR}" ] || LXD_CIDR="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
 [ -n "${PUB_IF}" ] || exit 0
 [ -n "${LXD_CIDR}" ] || exit 0
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 for IPT in iptables iptables-legacy; do
     command -v "${IPT}" >/dev/null 2>&1 || continue
+    while IFS= read -r RULE; do
+        [[ "${RULE}" == *"-s ${LXD_CIDR}"* ]] || continue
+        [[ "${RULE}" == *"-j MASQUERADE"* ]] || continue
+        [[ "${RULE}" != *"-o ${PUB_IF}"* ]] || continue
+        DELETE_RULE="${RULE/-A POSTROUTING/-D POSTROUTING}"
+        read -r -a DELETE_ARGS <<< "${DELETE_RULE}"
+        "${IPT}" -t nat "${DELETE_ARGS[@]}" >/dev/null 2>&1 || true
+    done < <("${IPT}" -t nat -S POSTROUTING 2>/dev/null || true)
     "${IPT}" -t nat -C POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || "${IPT}" -t nat -A POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || true
     "${IPT}" -C FORWARD -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || "${IPT}" -I FORWARD 1 -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || true
     "${IPT}" -C FORWARD -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || "${IPT}" -I FORWARD 1 -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
