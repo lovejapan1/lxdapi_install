@@ -180,6 +180,25 @@ add_forward_rule() {
     "${ipt}" -C FORWARD "$@" >/dev/null 2>&1 || "${ipt}" -I FORWARD 1 "$@" >/dev/null 2>&1 || true
 }
 
+add_masquerade_rule() {
+    local iface="$1"
+    local cidr="$2"
+    local ipt=""
+
+    for ipt in iptables iptables-legacy; do
+        command -v "${ipt}" >/dev/null 2>&1 || continue
+        "${ipt}" -t nat -C POSTROUTING -s "${cidr}" -o "${iface}" -j MASQUERADE >/dev/null 2>&1 || \
+            "${ipt}" -t nat -I POSTROUTING 1 -s "${cidr}" -o "${iface}" -j MASQUERADE >/dev/null 2>&1 || true
+    done
+
+    command -v nft >/dev/null 2>&1 || return 0
+    nft add table ip sakura_lxdapi_snat >/dev/null 2>&1 || true
+    nft add chain ip sakura_lxdapi_snat postrouting '{ type nat hook postrouting priority 101; policy accept; }' >/dev/null 2>&1 || true
+    if ! nft list chain ip sakura_lxdapi_snat postrouting 2>/dev/null | grep -Fq "ip saddr ${cidr} oifname \"${iface}\" masquerade"; then
+        nft add rule ip sakura_lxdapi_snat postrouting ip saddr "${cidr}" oifname "${iface}" masquerade >/dev/null 2>&1 || true
+    fi
+}
+
 mirror_dnat_rules() {
     command -v nft >/dev/null 2>&1 || return 0
     local lines=""
@@ -253,6 +272,7 @@ if [ -n "${cidr}" ]; then
             add_forward_rule "${ipt}" -i "${iface}" -o lxdbr0 -d "${cidr}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
             add_forward_rule "${ipt}" -i lxdbr0 -o "${iface}" -s "${cidr}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
         done
+        add_masquerade_rule "${iface}" "${cidr}"
     done < <(collect_ifaces | awk 'NF && !seen[$0]++')
 fi
 
@@ -419,7 +439,8 @@ main() {
         lxd) install_lxd_only ;;
         panel) install_panel_only ;;
         images|image) import_images_only ;;
-        update|fix) update_panel_only ;;
+        update) update_panel_only ;;
+        fix|repair) post_panel_fix ;;
         uninstall|remove) uninstall_panel_only ;;
         "")
             show_menu
