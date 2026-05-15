@@ -152,6 +152,161 @@ remove_manual_masquerade_rules() {
     done
 }
 
+collect_lxd_ingress_interfaces() {
+    local public_if="$1"
+    {
+        [ -n "${public_if}" ] && echo "${public_if}"
+        if command -v nft >/dev/null 2>&1; then
+            nft list ruleset 2>/dev/null | awk '
+                /dnat/ && /iifname/ {
+                    for (i=1; i<=NF; i++) {
+                        if ($i == "iifname") {
+                            gsub(/"/, "", $(i+1));
+                            print $(i+1);
+                        }
+                    }
+                }
+            '
+        fi
+    } | awk 'NF && !seen[$0]++'
+}
+
+add_forward_rule_for_ipt() {
+    local ipt="$1"
+    shift
+    command -v "${ipt}" >/dev/null 2>&1 || return 0
+    "${ipt}" -C FORWARD "$@" >/dev/null 2>&1 || "${ipt}" -I FORWARD 1 "$@" >/dev/null 2>&1 || true
+}
+
+install_lxd_forward_service() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    mkdir -p /usr/local/sbin
+    cat >/usr/local/sbin/sakura-lxdapi-forward.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/opt/lxdapi/configs/auto_nat.env"
+[ -f "${CONFIG_FILE}" ] && . "${CONFIG_FILE}" || true
+
+detect_public_if() {
+    local route_line=""
+    local route_if=""
+    local src_ip=""
+    local src_if=""
+
+    route_line="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+    route_if="$(echo "${route_line}" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    src_ip="$(echo "${route_line}" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+
+    if [ -n "${src_ip}" ]; then
+        src_if="$(ip -o -4 addr show scope global 2>/dev/null | awk -v ip="${src_ip}" '{split($4,a,"/"); if(a[1]==ip){print $2; exit}}')"
+        if [ -n "${src_if}" ] && ip link show "${src_if}" >/dev/null 2>&1; then
+            echo "${src_if}"
+            return 0
+        fi
+    fi
+
+    if [ -n "${route_if}" ] && ip link show "${route_if}" >/dev/null 2>&1; then
+        echo "${route_if}"
+        return 0
+    fi
+
+    ip -o -4 addr show scope global 2>/dev/null | awk '$2!="lo" {print $2; exit}'
+}
+
+detect_lxd_cidr_local() {
+    local cidr=""
+    cidr="$(ip -o -4 route show dev lxdbr0 scope link 2>/dev/null | awk '{print $1; exit}')"
+    [ -n "${cidr}" ] || cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
+    echo "${cidr}"
+}
+
+collect_ifaces() {
+    local public_if="${PUBLIC_INTERFACE:-}"
+    [ -n "${public_if}" ] && ip link show "${public_if}" >/dev/null 2>&1 && echo "${public_if}"
+    public_if="$(detect_public_if)"
+    [ -n "${public_if}" ] && echo "${public_if}"
+    if command -v nft >/dev/null 2>&1; then
+        nft list ruleset 2>/dev/null | awk '
+            /dnat/ && /iifname/ {
+                for (i=1; i<=NF; i++) {
+                    if ($i == "iifname") {
+                        gsub(/"/, "", $(i+1));
+                        print $(i+1);
+                    }
+                }
+            }
+        '
+    fi
+}
+
+add_rule() {
+    local ipt="$1"
+    shift
+    command -v "${ipt}" >/dev/null 2>&1 || return 0
+    "${ipt}" -C FORWARD "$@" >/dev/null 2>&1 || "${ipt}" -I FORWARD 1 "$@" >/dev/null 2>&1 || true
+}
+
+cidr="${LXD_CIDR:-}"
+[ -n "${cidr}" ] || cidr="$(detect_lxd_cidr_local)"
+[ -n "${cidr}" ] || exit 0
+
+while IFS= read -r iface; do
+    [ -n "${iface}" ] || continue
+    [ "${iface}" = "lo" ] && continue
+    [ "${iface}" = "lxdbr0" ] && continue
+    ip link show "${iface}" >/dev/null 2>&1 || continue
+    for ipt in iptables iptables-legacy; do
+        add_rule "${ipt}" -i "${iface}" -o lxdbr0 -d "${cidr}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+        add_rule "${ipt}" -i lxdbr0 -o "${iface}" -s "${cidr}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    done
+done < <(collect_ifaces | awk 'NF && !seen[$0]++')
+EOF
+
+    chmod +x /usr/local/sbin/sakura-lxdapi-forward.sh
+    cat >/etc/systemd/system/sakura-lxdapi-forward.service <<'EOF'
+[Unit]
+Description=Sakura LXDAPI forwarding rules
+After=network-online.target snap.lxd.daemon.service lxd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sakura-lxdapi-forward.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now sakura-lxdapi-forward.service >/dev/null 2>&1 || true
+}
+
+ensure_lxd_forward_rules() {
+    local public_if="${1:-}"
+    local lxd_cidr="${2:-}"
+    local iface=""
+    local ipt=""
+
+    [ -n "${public_if}" ] || public_if="$(detect_public_interface)"
+    [ -n "${lxd_cidr}" ] || lxd_cidr="$(detect_lxd_cidr)"
+    [ -n "${lxd_cidr}" ] || { warn "LXD CIDR not detected, skip forward rule fix"; return 0; }
+
+    while IFS= read -r iface; do
+        [ -n "${iface}" ] || continue
+        [ "${iface}" = "lo" ] && continue
+        [ "${iface}" = "lxdbr0" ] && continue
+        ip link show "${iface}" >/dev/null 2>&1 || continue
+        for ipt in iptables iptables-legacy; do
+            add_forward_rule_for_ipt "${ipt}" -i "${iface}" -o lxdbr0 -d "${lxd_cidr}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+            add_forward_rule_for_ipt "${ipt}" -i lxdbr0 -o "${iface}" -s "${lxd_cidr}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        done
+    done < <(collect_lxd_ingress_interfaces "${public_if}")
+
+    install_lxd_forward_service
+    ok "LXDAPI port forward rules checked"
+}
+
 ensure_lxd_native_network() {
     ensure_lxc_path
     ensure_forwarding_sysctl
@@ -183,6 +338,7 @@ ensure_lxd_native_network() {
     fi
 
     ok "LXD 原生 NAT 已开启"
+    ensure_lxd_forward_rules "$(detect_public_interface)" "$(detect_lxd_cidr)"
 }
 
 write_detected_nat_info() {
@@ -232,6 +388,7 @@ sync_lxdapi_panel_nat_config() {
 
     write_detected_nat_info "${public_if}" "${bind_ip}" "${display_ip}" "${lxd_cidr}"
     remove_manual_masquerade_rules "${lxd_cidr}"
+    ensure_lxd_forward_rules "${public_if}" "${lxd_cidr}"
 
     [ -f "${DB_FILE}" ] || return 0
 
