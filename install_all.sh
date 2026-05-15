@@ -5,8 +5,9 @@ REPO="lovejapan1/lxdapi_install"
 BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 SERVICE_NAME="lxdapi"
-CONFIG_FILE="/opt/lxdapi/configs/config.yaml"
-DB_FILE="/opt/lxdapi/lxdapi.db"
+INSTALL_DIR="/opt/lxdapi"
+CONFIG_FILE="${INSTALL_DIR}/configs/config.yaml"
+DB_FILE="${INSTALL_DIR}/lxdapi.db"
 
 BLUE='\033[0;34m'
 GREEN='\033[0;32m'
@@ -37,13 +38,21 @@ run_remote_script() {
     bash "${tmp_file}"
 }
 
+lxc_cmd() {
+    if command -v lxc >/dev/null 2>&1; then
+        command lxc "$@"
+    elif [ -x /snap/bin/lxc ]; then
+        /snap/bin/lxc "$@"
+    else
+        return 127
+    fi
+}
+
 ensure_lxc_path() {
     if command -v lxc >/dev/null 2>&1; then
         return 0
     fi
-
     if [ -x /snap/bin/lxc ]; then
-        info "修复 lxc 命令路径..."
         mkdir -p /usr/local/bin
         ln -sf /snap/bin/lxc /usr/local/bin/lxc
         export PATH="/usr/local/bin:/snap/bin:${PATH}"
@@ -70,48 +79,39 @@ detect_display_ipv4() {
     if command -v curl >/dev/null 2>&1; then
         public_ip="$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
     fi
-    if [ -z "${public_ip}" ]; then
-        public_ip="${fallback_ip}"
-    fi
+    [ -n "${public_ip}" ] || public_ip="${fallback_ip}"
     echo "${public_ip}"
 }
 
 detect_lxd_cidr() {
     local cidr=""
     cidr="$(ip -o -4 route show dev lxdbr0 scope link 2>/dev/null | awk '{print $1; exit}')"
-    if [ -z "${cidr}" ]; then
-        cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
-    fi
+    [ -n "${cidr}" ] || cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
     echo "${cidr}"
 }
 
-apply_base_firewall_rules() {
-    local ipt=""
-    for ipt in iptables iptables-legacy; do
-        command -v "${ipt}" >/dev/null 2>&1 || continue
-        "${ipt}" -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I INPUT 1 -i lo -j ACCEPT >/dev/null 2>&1 || true
-        "${ipt}" -C OUTPUT -o lo -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I OUTPUT 1 -o lo -j ACCEPT >/dev/null 2>&1 || true
-        "${ipt}" -C INPUT -p tcp --dport 8443 -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I INPUT 1 -p tcp --dport 8443 -j ACCEPT >/dev/null 2>&1 || true
-        "${ipt}" -C FORWARD -j ACCEPT >/dev/null 2>&1 || "${ipt}" -I FORWARD 1 -j ACCEPT >/dev/null 2>&1 || true
-    done
+ensure_forwarding_sysctl() {
+    mkdir -p /etc/sysctl.d
+    cat >/etc/sysctl.d/99-sakura-lxdapi-forward.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
 }
 
-remove_stale_lxd_nat_rules() {
-    local public_if="$1"
-    local lxd_cidr="$2"
+remove_manual_masquerade_rules() {
+    local lxd_cidr="$1"
     local ipt=""
     local rule=""
     local delete_rule=""
 
-    [ -n "${public_if}" ] || return 0
     [ -n "${lxd_cidr}" ] || return 0
-
     for ipt in iptables iptables-legacy; do
         command -v "${ipt}" >/dev/null 2>&1 || continue
         while IFS= read -r rule; do
             [[ "${rule}" == *"-s ${lxd_cidr}"* ]] || continue
             [[ "${rule}" == *"-j MASQUERADE"* ]] || continue
-            [[ "${rule}" != *"-o ${public_if}"* ]] || continue
             delete_rule="${rule/-A POSTROUTING/-D POSTROUTING}"
             read -r -a delete_args <<< "${delete_rule}"
             "${ipt}" -t nat "${delete_args[@]}" >/dev/null 2>&1 || true
@@ -119,100 +119,37 @@ remove_stale_lxd_nat_rules() {
     done
 }
 
-apply_lxd_nat_rules() {
-    local public_if="$1"
-    local lxd_cidr="$2"
-    local ipt=""
-
-    [ -n "${public_if}" ] || return 0
-    [ -n "${lxd_cidr}" ] || return 0
-
-    remove_stale_lxd_nat_rules "${public_if}" "${lxd_cidr}"
-
-    for ipt in iptables iptables-legacy; do
-        command -v "${ipt}" >/dev/null 2>&1 || continue
-        "${ipt}" -t nat -C POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || \
-            "${ipt}" -t nat -A POSTROUTING -s "${lxd_cidr}" -o "${public_if}" -j MASQUERADE >/dev/null 2>&1 || true
-        "${ipt}" -C FORWARD -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || \
-            "${ipt}" -I FORWARD 1 -i lxdbr0 -o "${public_if}" -j ACCEPT >/dev/null 2>&1 || true
-        "${ipt}" -C FORWARD -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || \
-            "${ipt}" -I FORWARD 1 -i "${public_if}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
-    done
-}
-
-ensure_port_forwarding_runtime() {
-    info "检查端口转发运行环境..."
-
-    if command -v apt-get >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 procps nftables iptables >/dev/null 2>&1 || true
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y iproute procps-ng nftables iptables >/dev/null 2>&1 || true
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y iproute procps-ng nftables iptables >/dev/null 2>&1 || true
-    fi
-
-    modprobe nf_tables >/dev/null 2>&1 || true
-    modprobe br_netfilter >/dev/null 2>&1 || true
-
-    mkdir -p /etc/sysctl.d
-    cat >/etc/sysctl.d/99-sakura-lxdapi-forward.conf <<'EOF'
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable --now nftables >/dev/null 2>&1 || true
-    fi
-
-    apply_base_firewall_rules
-    ok "端口转发运行环境已处理"
-}
-
-ensure_lxd_internal_ipv4() {
+ensure_lxd_native_network() {
     ensure_lxc_path
+    ensure_forwarding_sysctl
 
-    if ! command -v lxc >/dev/null 2>&1; then
-        warn "未检测到 lxc，跳过 LXD 网桥检查"
+    if ! lxc_cmd list >/dev/null 2>&1; then
+        warn "lxc 暂不可用，跳过 LXD 网络修复"
         return 0
     fi
 
-    info "检查 LXD 内网 IPv4 与默认网卡配置..."
-
-    if ! lxc network show lxdbr0 >/dev/null 2>&1; then
-        info "创建 lxdbr0 网桥..."
-        lxc network create lxdbr0 ipv4.address=auto ipv4.dhcp=true ipv4.nat=true ipv6.address=none >/dev/null 2>&1 || true
+    if ! lxc_cmd network show lxdbr0 >/dev/null 2>&1; then
+        info "按原版逻辑创建 lxdbr0..."
+        lxc_cmd network create lxdbr0 >/dev/null 2>&1 || true
     fi
 
-    local ipv4_addr=""
-    ipv4_addr="$(lxc network get lxdbr0 ipv4.address 2>/dev/null || true)"
-    if [ -z "${ipv4_addr}" ] || [ "${ipv4_addr}" = "none" ]; then
-        info "为 lxdbr0 开启内网 IPv4..."
-        lxc network set lxdbr0 ipv4.address auto >/dev/null 2>&1 || \
-            lxc network set lxdbr0 ipv4.address 10.10.10.1/24 >/dev/null 2>&1 || true
-    fi
+    lxc_cmd network set lxdbr0 ipv4.dhcp true >/dev/null 2>&1 || true
+    lxc_cmd network set lxdbr0 ipv4.nat true >/dev/null 2>&1 || true
 
-    lxc network set lxdbr0 ipv4.dhcp true >/dev/null 2>&1 || true
-    lxc network set lxdbr0 ipv4.nat true >/dev/null 2>&1 || true
-
-    if ! lxc profile device show default 2>/dev/null | grep -q '^eth0:'; then
-        lxc profile device add default eth0 nic nictype=bridged parent=lxdbr0 name=eth0 >/dev/null 2>&1 || true
+    if ! lxc_cmd profile device show default 2>/dev/null | grep -q '^eth0:'; then
+        lxc_cmd profile device add default eth0 nic network=lxdbr0 name=eth0 >/dev/null 2>&1 || true
     else
-        lxc profile device set default eth0 nictype bridged >/dev/null 2>&1 || true
-        lxc profile device set default eth0 parent lxdbr0 >/dev/null 2>&1 || true
-        lxc profile device set default eth0 name eth0 >/dev/null 2>&1 || true
+        lxc_cmd profile device set default eth0 network lxdbr0 >/dev/null 2>&1 || true
+        lxc_cmd profile device set default eth0 name eth0 >/dev/null 2>&1 || true
     fi
 
-    if lxc storage show default >/dev/null 2>&1; then
-        if ! lxc profile device show default 2>/dev/null | grep -q '^root:'; then
-            lxc profile device add default root disk path=/ pool=default >/dev/null 2>&1 || true
+    if lxc_cmd storage show default >/dev/null 2>&1; then
+        if ! lxc_cmd profile device show default 2>/dev/null | grep -q '^root:'; then
+            lxc_cmd profile device add default root disk path=/ pool=default >/dev/null 2>&1 || true
         fi
     fi
 
-    ok "LXD 内网 IPv4 已处理"
+    ok "LXD 原生 NAT 已开启"
 }
 
 write_detected_nat_info() {
@@ -221,8 +158,8 @@ write_detected_nat_info() {
     local display_ip="$3"
     local lxd_cidr="$4"
 
-    mkdir -p /opt/lxdapi/configs 2>/dev/null || true
-    cat >/opt/lxdapi/configs/auto_nat.env <<EOF
+    mkdir -p "${INSTALL_DIR}/configs" 2>/dev/null || true
+    cat >"${INSTALL_DIR}/configs/auto_nat.env" <<EOF
 PUBLIC_INTERFACE=${public_if}
 BIND_IPV4=${bind_ip}
 DISPLAY_IPV4=${display_ip}
@@ -234,6 +171,7 @@ sync_lxdapi_panel_nat_config() {
     local public_if=""
     local bind_ip=""
     local display_ip=""
+    local lxd_cidr=""
     local table=""
     local columns=""
     local key_col=""
@@ -245,15 +183,24 @@ sync_lxdapi_panel_nat_config() {
     local escaped=""
     local sql=""
 
-    [ -f "${DB_FILE}" ] || return 0
-
     public_if="$(detect_public_interface)"
     bind_ip="$(detect_bind_ipv4 "${public_if}")"
     display_ip="$(detect_display_ipv4 "${bind_ip}")"
-    [ -n "${public_if}" ] || return 0
+    lxd_cidr="$(detect_lxd_cidr)"
+
+    [ -n "${public_if}" ] || { warn "未检测到公网出口网卡"; return 0; }
     [ -n "${bind_ip}" ] || bind_ip="${display_ip}"
-    [ -n "${bind_ip}" ] || return 0
     [ -n "${display_ip}" ] || display_ip="${bind_ip}"
+
+    info "自动识别公网网卡: ${public_if}"
+    info "自动识别绑定 IPv4: ${bind_ip}"
+    info "自动识别显示 IPv4: ${display_ip}"
+    [ -n "${lxd_cidr}" ] && info "自动识别 LXD 网段: ${lxd_cidr}"
+
+    write_detected_nat_info "${public_if}" "${bind_ip}" "${display_ip}" "${lxd_cidr}"
+    remove_manual_masquerade_rules "${lxd_cidr}"
+
+    [ -f "${DB_FILE}" ] || return 0
 
     if ! command -v sqlite3 >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
@@ -268,10 +215,10 @@ sync_lxdapi_panel_nat_config() {
     command -v sqlite3 >/dev/null 2>&1 || { warn "未找到 sqlite3，跳过面板 NAT 自动同步"; return 0; }
     command -v perl >/dev/null 2>&1 || { warn "未找到 perl，跳过面板 NAT 自动同步"; return 0; }
 
-    info "自动同步面板 IPv4 NAT 配置: ${public_if} / ${bind_ip}"
     cp -a "${DB_FILE}" "${DB_FILE}.bak_nat.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
 
-    for table in $(sqlite3 "${DB_FILE}" "SELECT name FROM sqlite_master WHERE type='table';" 2>/dev/null || true); do
+    for table in system_configs configs settings; do
+        sqlite3 "${DB_FILE}" "SELECT name FROM sqlite_master WHERE type='table' AND name='${table}';" 2>/dev/null | grep -qx "${table}" || continue
         columns="$(sqlite3 "${DB_FILE}" "PRAGMA table_info(\"${table}\");" 2>/dev/null | awk -F'|' '{print $2}')"
         key_col=""
         value_col=""
@@ -285,10 +232,6 @@ sync_lxdapi_panel_nat_config() {
         [ -n "${value_col}" ] || continue
 
         count="$(sqlite3 "${DB_FILE}" "SELECT COUNT(*) FROM \"${table}\" WHERE \"${key_col}\"='snat_config_v4';" 2>/dev/null || echo 0)"
-        if [ "${count}" = "0" ] && [ "${table}" != "configs" ]; then
-            continue
-        fi
-
         current="$(sqlite3 "${DB_FILE}" "SELECT \"${value_col}\" FROM \"${table}\" WHERE \"${key_col}\"='snat_config_v4' LIMIT 1;" 2>/dev/null || true)"
         merged="$(CURRENT_JSON="${current}" NAT_IF="${public_if}" NAT_IP="${bind_ip}" NAT_DISPLAY="${display_ip}" perl -MJSON::PP -e '
             my $json = $ENV{CURRENT_JSON} // "";
@@ -326,119 +269,22 @@ sync_lxdapi_panel_nat_config() {
         return 0
     done
 
-    warn "未找到可自动同步的面板 NAT 配置表；已写入 /opt/lxdapi/configs/auto_nat.env"
-}
-
-ensure_host_lxd_nat() {
-    if ! command -v ip >/dev/null 2>&1; then
-        warn "缺少 ip 命令，跳过宿主机 LXD 出口 NAT 兜底"
-        return 0
-    fi
-
-    local public_if=""
-    local bind_ip=""
-    local display_ip=""
-    local lxd_cidr=""
-    public_if="$(detect_public_interface)"
-    bind_ip="$(detect_bind_ipv4 "${public_if}")"
-    display_ip="$(detect_display_ipv4 "${bind_ip}")"
-    lxd_cidr="$(detect_lxd_cidr)"
-
-    if [ -z "${public_if}" ]; then
-        warn "未检测到公网出口网卡，请检查默认路由"
-        return 0
-    fi
-
-    if [ -z "${lxd_cidr}" ]; then
-        warn "lxdbr0 没有 IPv4 地址，跳过 LXD 出口 NAT 兜底"
-        return 0
-    fi
-
-    [ -n "${bind_ip}" ] || bind_ip="${display_ip}"
-    [ -n "${display_ip}" ] || display_ip="${bind_ip}"
-
-    info "检测到公网出口网卡: ${public_if}"
-    info "检测到绑定 IPv4: ${bind_ip}"
-    info "检测到用户显示 IPv4: ${display_ip}"
-    info "检测到 LXD 内网网段: ${lxd_cidr}"
-    info "面板 IPv4 NAT 配置里的网卡接口会自动使用: ${public_if}"
-
-    write_detected_nat_info "${public_if}" "${bind_ip}" "${display_ip}" "${lxd_cidr}"
-    apply_lxd_nat_rules "${public_if}" "${lxd_cidr}"
-
-    mkdir -p /usr/local/sbin
-    cat >/usr/local/sbin/sakura-lxdapi-nat.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-command -v ip >/dev/null 2>&1 || exit 0
-PUB_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-LXD_CIDR="$(ip -o -4 route show dev lxdbr0 scope link 2>/dev/null | awk '{print $1; exit}')"
-[ -n "${LXD_CIDR}" ] || LXD_CIDR="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
-[ -n "${PUB_IF}" ] || exit 0
-[ -n "${LXD_CIDR}" ] || exit 0
-sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-for IPT in iptables iptables-legacy; do
-    command -v "${IPT}" >/dev/null 2>&1 || continue
-    while IFS= read -r RULE; do
-        [[ "${RULE}" == *"-s ${LXD_CIDR}"* ]] || continue
-        [[ "${RULE}" == *"-j MASQUERADE"* ]] || continue
-        [[ "${RULE}" != *"-o ${PUB_IF}"* ]] || continue
-        DELETE_RULE="${RULE/-A POSTROUTING/-D POSTROUTING}"
-        read -r -a DELETE_ARGS <<< "${DELETE_RULE}"
-        "${IPT}" -t nat "${DELETE_ARGS[@]}" >/dev/null 2>&1 || true
-    done < <("${IPT}" -t nat -S POSTROUTING 2>/dev/null || true)
-    "${IPT}" -t nat -C POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || "${IPT}" -t nat -A POSTROUTING -s "${LXD_CIDR}" -o "${PUB_IF}" -j MASQUERADE >/dev/null 2>&1 || true
-    "${IPT}" -C FORWARD -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || "${IPT}" -I FORWARD 1 -i lxdbr0 -o "${PUB_IF}" -j ACCEPT >/dev/null 2>&1 || true
-    "${IPT}" -C FORWARD -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || "${IPT}" -I FORWARD 1 -i "${PUB_IF}" -o lxdbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
-done
-EOF
-    chmod +x /usr/local/sbin/sakura-lxdapi-nat.sh
-
-    if command -v systemctl >/dev/null 2>&1; then
-        cat >/etc/systemd/system/sakura-lxdapi-nat.service <<'EOF'
-[Unit]
-Description=Sakura LXDAPI LXD NAT fallback
-After=network-online.target snap.lxd.daemon.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/sakura-lxdapi-nat.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable --now sakura-lxdapi-nat.service >/dev/null 2>&1 || true
-    fi
-
-    ok "LXD 出口 NAT 已处理"
+    warn "未找到面板 NAT 配置表，只写入 auto_nat.env"
 }
 
 patch_panel_binary_words() {
-    if [ ! -d /opt/lxdapi ]; then
-        return 0
-    fi
-
+    [ -d "${INSTALL_DIR}" ] || return 0
     local bins=""
-    bins="$(find /opt/lxdapi -maxdepth 1 -type f -name 'lxdapi-*' 2>/dev/null || true)"
-    if [ -z "${bins}" ]; then
-        return 0
-    fi
+    bins="$(find "${INSTALL_DIR}" -maxdepth 1 -type f -name 'lxdapi-*' 2>/dev/null || true)"
+    [ -n "${bins}" ] || return 0
 
     if ! command -v perl >/dev/null 2>&1; then
         if command -v apt-get >/dev/null 2>&1; then
             DEBIAN_FRONTEND=noninteractive apt-get install -y perl >/dev/null 2>&1 || true
         fi
     fi
+    command -v perl >/dev/null 2>&1 || return 0
 
-    if ! command -v perl >/dev/null 2>&1; then
-        warn "未找到 perl，跳过面板残留文字修复"
-        return 0
-    fi
-
-    info "修复面板残留文字..."
     while IFS= read -r bin; do
         [ -n "${bin}" ] || continue
         local backup="${bin}.bak_words"
@@ -451,33 +297,11 @@ patch_panel_binary_words() {
         fi
         chmod +x "${bin}" 2>/dev/null || true
     done <<< "${bins}"
-    ok "面板残留文字已处理"
-}
-
-cleanup_unused_runtime_files() {
-    info "清理安装缓存和临时备份..."
-    rm -f /opt/lxdapi/lxdapi-*.bak_words 2>/dev/null || true
-    rm -f /tmp/lxd_install.sh /tmp/lxdapi_install.sh /tmp/lxdapi_update.sh /tmp/image_import.sh /tmp/lxdapi_uninstall.sh 2>/dev/null || true
-
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get clean >/dev/null 2>&1 || true
-    fi
-
-    if [ -d /var/lib/snapd/cache ]; then
-        find /var/lib/snapd/cache -type f -delete 2>/dev/null || true
-    fi
-    ok "无用缓存已清理"
 }
 
 disable_lxdapi_acme() {
-    if [ ! -f "${CONFIG_FILE}" ]; then
-        warn "未找到 ${CONFIG_FILE}，跳过 ACME 配置修复"
-        return 0
-    fi
-
-    info "关闭面板内置 ACME，避免 IP 证书签发阻塞服务..."
+    [ -f "${CONFIG_FILE}" ] || return 0
     cp -a "${CONFIG_FILE}" "${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-
     awk '
         BEGIN { in_acme=0 }
         /^[[:space:]]*acme:[[:space:]]*$/ { in_acme=1; print; next }
@@ -485,49 +309,28 @@ disable_lxdapi_acme() {
         in_acme && /^[^[:space:]]/ { in_acme=0 }
         { print }
     ' "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
-
     pkill -f "acme.sh --issue" 2>/dev/null || true
-    ok "ACME 已关闭"
+}
+
+cleanup_unused_runtime_files() {
+    rm -f /opt/lxdapi/lxdapi-*.bak_words 2>/dev/null || true
+    rm -f /tmp/lxd_install.sh /tmp/lxdapi_install.sh /tmp/lxdapi_update.sh /tmp/image_import.sh /tmp/lxdapi_uninstall.sh 2>/dev/null || true
+    command -v apt-get >/dev/null 2>&1 && apt-get clean >/dev/null 2>&1 || true
+    [ -d /var/lib/snapd/cache ] && find /var/lib/snapd/cache -type f -delete 2>/dev/null || true
 }
 
 restart_lxdapi_after_install() {
-    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
-        warn "未找到 ${SERVICE_NAME}.service，跳过服务重启检查"
-        return 0
-    fi
-
-    info "重启 ${SERVICE_NAME} 服务..."
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart "${SERVICE_NAME}" || true
-    sleep 3
-
-    if systemctl is-active --quiet "${SERVICE_NAME}"; then
-        ok "${SERVICE_NAME} 服务已运行"
-    else
-        warn "${SERVICE_NAME} 服务未正常运行，请查看: journalctl -u ${SERVICE_NAME} -n 100 --no-pager"
-        return 0
-    fi
-
-    local port="8443"
-    if [ -f "${CONFIG_FILE}" ]; then
-        port="$(awk -F': *' '/^[[:space:]]*port:[[:space:]]*/ {print $2; exit}' "${CONFIG_FILE}" 2>/dev/null || true)"
-        [ -n "${port}" ] || port="8443"
-    fi
-
-    if command -v curl >/dev/null 2>&1; then
-        if curl -k -m 8 -fsS "https://127.0.0.1:${port}/admin/login" >/dev/null 2>&1; then
-            ok "面板本机访问正常: https://127.0.0.1:${port}/admin/login"
-        else
-            warn "面板本机访问未通过，请检查防火墙和日志"
-        fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl restart "${SERVICE_NAME}" || true
+        sleep 3
+        systemctl is-active --quiet "${SERVICE_NAME}" && ok "${SERVICE_NAME} 服务已运行" || warn "${SERVICE_NAME} 服务未正常运行"
     fi
 }
 
 post_panel_install_fix() {
     ensure_lxc_path
-    ensure_lxd_internal_ipv4
-    ensure_port_forwarding_runtime
-    ensure_host_lxd_nat
+    ensure_lxd_native_network
     sync_lxdapi_panel_nat_config
     patch_panel_binary_words
     cleanup_unused_runtime_files
@@ -537,40 +340,27 @@ post_panel_install_fix() {
 
 offer_cleanup_existing_lxd_instances() {
     ensure_lxc_path
-
-    if ! command -v lxc >/dev/null 2>&1; then
-        return 0
-    fi
-
+    lxc_cmd list >/dev/null 2>&1 || return 0
     local names=""
-    names="$(lxc list --format csv -c n 2>/dev/null || true)"
-    if [ -z "${names}" ]; then
-        ok "当前 LXD 没有残留服务器实例"
-        return 0
-    fi
+    names="$(lxc_cmd list --format csv -c n 2>/dev/null || true)"
+    [ -n "${names}" ] || { ok "当前 LXD 没有残留服务器实例"; return 0; }
 
-    warn "检测到 LXD 中已有实例，这可能导致面板或 WHMCS 创建同名服务器失败:"
+    warn "检测到 LXD 中已有实例，可能导致 WHMCS 创建同名服务器失败:"
     echo "${names}"
-    echo
-    read -rp "是否删除这些残留 LXD 实例？仅影响 LXD 实例，不删除面板程序。(y/n) [n]: " cleanup
+    read -rp "是否删除这些残留 LXD 实例？(y/n) [n]: " cleanup
     cleanup="${cleanup:-n}"
     if [[ "${cleanup}" =~ ^[Yy]$ ]]; then
         while IFS= read -r name; do
             [ -n "${name}" ] || continue
-            info "删除残留实例: ${name}"
-            lxc delete -f "${name}" >/dev/null 2>&1 || warn "删除失败: ${name}"
+            lxc_cmd delete -f "${name}" >/dev/null 2>&1 || warn "删除失败: ${name}"
         done <<< "${names}"
-        ok "残留 LXD 实例清理完成"
-    else
-        warn "已保留现有 LXD 实例；如果创建同名服务器仍失败，请先删除或换名"
     fi
 }
 
 install_lxd_only() {
     run_remote_script "lxd_install.sh"
-    ensure_lxd_internal_ipv4
-    ensure_port_forwarding_runtime
-    ensure_host_lxd_nat
+    ensure_lxd_native_network
+    sync_lxdapi_panel_nat_config
     cleanup_unused_runtime_files
     offer_cleanup_existing_lxd_instances
 }
@@ -623,26 +413,13 @@ show_menu() {
 
 main() {
     local action="${1:-}"
-
     case "${action}" in
-        install|all)
-            run_full_install
-            ;;
-        lxd)
-            install_lxd_only
-            ;;
-        panel)
-            install_panel_only
-            ;;
-        images|image)
-            import_images_only
-            ;;
-        update)
-            update_panel_only
-            ;;
-        uninstall|remove)
-            uninstall_panel_only
-            ;;
+        install|all) run_full_install ;;
+        lxd) install_lxd_only ;;
+        panel) install_panel_only ;;
+        images|image) import_images_only ;;
+        update) update_panel_only ;;
+        uninstall|remove) uninstall_panel_only ;;
         "")
             show_header
             show_menu
