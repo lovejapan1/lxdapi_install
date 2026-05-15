@@ -6,6 +6,7 @@ BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 SERVICE_NAME="lxdapi"
 CONFIG_FILE="/opt/lxdapi/configs/config.yaml"
+DB_FILE="/opt/lxdapi/lxdapi.db"
 
 BLUE='\033[0;34m'
 GREEN='\033[0;32m'
@@ -47,6 +48,41 @@ ensure_lxc_path() {
         ln -sf /snap/bin/lxc /usr/local/bin/lxc
         export PATH="/usr/local/bin:/snap/bin:${PATH}"
     fi
+}
+
+detect_public_interface() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+detect_bind_ipv4() {
+    local iface="$1"
+    local ip_addr=""
+    ip_addr="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    if [ -z "${ip_addr}" ] && [ -n "${iface}" ]; then
+        ip_addr="$(ip -o -4 addr show dev "${iface}" scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')"
+    fi
+    echo "${ip_addr}"
+}
+
+detect_display_ipv4() {
+    local fallback_ip="$1"
+    local public_ip=""
+    if command -v curl >/dev/null 2>&1; then
+        public_ip="$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+    fi
+    if [ -z "${public_ip}" ]; then
+        public_ip="${fallback_ip}"
+    fi
+    echo "${public_ip}"
+}
+
+detect_lxd_cidr() {
+    local cidr=""
+    cidr="$(ip -o -4 route show dev lxdbr0 scope link 2>/dev/null | awk '{print $1; exit}')"
+    if [ -z "${cidr}" ]; then
+        cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
+    fi
+    echo "${cidr}"
 }
 
 apply_base_firewall_rules() {
@@ -179,6 +215,120 @@ ensure_lxd_internal_ipv4() {
     ok "LXD 内网 IPv4 已处理"
 }
 
+write_detected_nat_info() {
+    local public_if="$1"
+    local bind_ip="$2"
+    local display_ip="$3"
+    local lxd_cidr="$4"
+
+    mkdir -p /opt/lxdapi/configs 2>/dev/null || true
+    cat >/opt/lxdapi/configs/auto_nat.env <<EOF
+PUBLIC_INTERFACE=${public_if}
+BIND_IPV4=${bind_ip}
+DISPLAY_IPV4=${display_ip}
+LXD_CIDR=${lxd_cidr}
+EOF
+}
+
+sync_lxdapi_panel_nat_config() {
+    local public_if=""
+    local bind_ip=""
+    local display_ip=""
+    local table=""
+    local columns=""
+    local key_col=""
+    local value_col=""
+    local col=""
+    local count="0"
+    local current=""
+    local merged=""
+    local escaped=""
+    local sql=""
+
+    [ -f "${DB_FILE}" ] || return 0
+
+    public_if="$(detect_public_interface)"
+    bind_ip="$(detect_bind_ipv4 "${public_if}")"
+    display_ip="$(detect_display_ipv4 "${bind_ip}")"
+    [ -n "${public_if}" ] || return 0
+    [ -n "${bind_ip}" ] || bind_ip="${display_ip}"
+    [ -n "${bind_ip}" ] || return 0
+    [ -n "${display_ip}" ] || display_ip="${bind_ip}"
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 >/dev/null 2>&1 || true
+        fi
+    fi
+    if ! command -v perl >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y perl >/dev/null 2>&1 || true
+        fi
+    fi
+    command -v sqlite3 >/dev/null 2>&1 || { warn "未找到 sqlite3，跳过面板 NAT 自动同步"; return 0; }
+    command -v perl >/dev/null 2>&1 || { warn "未找到 perl，跳过面板 NAT 自动同步"; return 0; }
+
+    info "自动同步面板 IPv4 NAT 配置: ${public_if} / ${bind_ip}"
+    cp -a "${DB_FILE}" "${DB_FILE}.bak_nat.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+
+    for table in $(sqlite3 "${DB_FILE}" "SELECT name FROM sqlite_master WHERE type='table';" 2>/dev/null || true); do
+        columns="$(sqlite3 "${DB_FILE}" "PRAGMA table_info(\"${table}\");" 2>/dev/null | awk -F'|' '{print $2}')"
+        key_col=""
+        value_col=""
+        for col in key config_key name config_name; do
+            echo "${columns}" | grep -qx "${col}" && { key_col="${col}"; break; }
+        done
+        for col in value config_value data content; do
+            echo "${columns}" | grep -qx "${col}" && { value_col="${col}"; break; }
+        done
+        [ -n "${key_col}" ] || continue
+        [ -n "${value_col}" ] || continue
+
+        count="$(sqlite3 "${DB_FILE}" "SELECT COUNT(*) FROM \"${table}\" WHERE \"${key_col}\"='snat_config_v4';" 2>/dev/null || echo 0)"
+        if [ "${count}" = "0" ] && [ "${table}" != "configs" ]; then
+            continue
+        fi
+
+        current="$(sqlite3 "${DB_FILE}" "SELECT \"${value_col}\" FROM \"${table}\" WHERE \"${key_col}\"='snat_config_v4' LIMIT 1;" 2>/dev/null || true)"
+        merged="$(CURRENT_JSON="${current}" NAT_IF="${public_if}" NAT_IP="${bind_ip}" NAT_DISPLAY="${display_ip}" perl -MJSON::PP -e '
+            my $json = $ENV{CURRENT_JSON} // "";
+            my $arr = eval { decode_json($json) };
+            $arr = [] unless ref($arr) eq "ARRAY";
+            my $found = 0;
+            for my $item (@$arr) {
+                next unless ref($item) eq "HASH";
+                my $iface = $item->{interface} // "";
+                my $ip = $item->{ip} // "";
+                my $display = $item->{display_ip} // "";
+                if ($iface eq "eth0" || $ip eq $ENV{NAT_IP} || $display eq $ENV{NAT_DISPLAY}) {
+                    $item->{interface} = $ENV{NAT_IF};
+                    $item->{ip} = $ENV{NAT_IP};
+                    $item->{display_ip} = $ENV{NAT_DISPLAY};
+                    $item->{protocol} = "both" unless $item->{protocol};
+                    $found = 1;
+                }
+            }
+            if (!@$arr || !$found) {
+                push @$arr, { interface => $ENV{NAT_IF}, ip => $ENV{NAT_IP}, display_ip => $ENV{NAT_DISPLAY}, protocol => "both" };
+            }
+            print encode_json($arr);
+        ' 2>/dev/null || true)"
+        [ -n "${merged}" ] || continue
+        escaped="${merged//\'/\'\'}"
+
+        if [ "${count}" = "0" ]; then
+            sql="INSERT INTO \"${table}\" (\"${key_col}\", \"${value_col}\") VALUES ('snat_config_v4', '${escaped}');"
+        else
+            sql="UPDATE \"${table}\" SET \"${value_col}\"='${escaped}' WHERE \"${key_col}\"='snat_config_v4';"
+        fi
+        sqlite3 "${DB_FILE}" "${sql}" >/dev/null 2>&1 || true
+        ok "面板 IPv4 NAT 配置已自动同步"
+        return 0
+    done
+
+    warn "未找到可自动同步的面板 NAT 配置表；已写入 /opt/lxdapi/configs/auto_nat.env"
+}
+
 ensure_host_lxd_nat() {
     if ! command -v ip >/dev/null 2>&1; then
         warn "缺少 ip 命令，跳过宿主机 LXD 出口 NAT 兜底"
@@ -186,10 +336,13 @@ ensure_host_lxd_nat() {
     fi
 
     local public_if=""
+    local bind_ip=""
+    local display_ip=""
     local lxd_cidr=""
-    public_if="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-    lxd_cidr="$(ip -o -4 route show dev lxdbr0 scope link 2>/dev/null | awk '{print $1; exit}')"
-    [ -n "${lxd_cidr}" ] || lxd_cidr="$(ip -o -4 addr show lxdbr0 2>/dev/null | awk '{print $4; exit}')"
+    public_if="$(detect_public_interface)"
+    bind_ip="$(detect_bind_ipv4 "${public_if}")"
+    display_ip="$(detect_display_ipv4 "${bind_ip}")"
+    lxd_cidr="$(detect_lxd_cidr)"
 
     if [ -z "${public_if}" ]; then
         warn "未检测到公网出口网卡，请检查默认路由"
@@ -201,10 +354,16 @@ ensure_host_lxd_nat() {
         return 0
     fi
 
-    info "检测到公网出口网卡: ${public_if}"
-    info "检测到 LXD 内网网段: ${lxd_cidr}"
-    info "面板 IPv4 NAT 配置里的网卡接口也应填写: ${public_if}"
+    [ -n "${bind_ip}" ] || bind_ip="${display_ip}"
+    [ -n "${display_ip}" ] || display_ip="${bind_ip}"
 
+    info "检测到公网出口网卡: ${public_if}"
+    info "检测到绑定 IPv4: ${bind_ip}"
+    info "检测到用户显示 IPv4: ${display_ip}"
+    info "检测到 LXD 内网网段: ${lxd_cidr}"
+    info "面板 IPv4 NAT 配置里的网卡接口会自动使用: ${public_if}"
+
+    write_detected_nat_info "${public_if}" "${bind_ip}" "${display_ip}" "${lxd_cidr}"
     apply_lxd_nat_rules "${public_if}" "${lxd_cidr}"
 
     mkdir -p /usr/local/sbin
@@ -369,6 +528,7 @@ post_panel_install_fix() {
     ensure_lxd_internal_ipv4
     ensure_port_forwarding_runtime
     ensure_host_lxd_nat
+    sync_lxdapi_panel_nat_config
     patch_panel_binary_words
     cleanup_unused_runtime_files
     disable_lxdapi_acme
