@@ -60,15 +60,48 @@ ensure_lxc_path() {
 }
 
 detect_public_interface() {
-    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+    local route_line=""
+    local route_if=""
+    local src_ip=""
+    local src_if=""
+    local default_if=""
+    local global_if=""
+
+    route_line="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+    route_if="$(echo "${route_line}" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    src_ip="$(echo "${route_line}" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+
+    if [ -n "${src_ip}" ]; then
+        src_if="$(ip -o -4 addr show scope global 2>/dev/null | awk -v ip="${src_ip}" '{split($4,a,"/"); if(a[1]==ip){print $2; exit}}')"
+        if [ -n "${src_if}" ] && ip link show "${src_if}" >/dev/null 2>&1; then
+            echo "${src_if}"
+            return 0
+        fi
+    fi
+
+    if [ -n "${route_if}" ] && ip link show "${route_if}" >/dev/null 2>&1; then
+        echo "${route_if}"
+        return 0
+    fi
+
+    default_if="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    if [ -n "${default_if}" ] && ip link show "${default_if}" >/dev/null 2>&1; then
+        echo "${default_if}"
+        return 0
+    fi
+
+    global_if="$(ip -o -4 addr show scope global 2>/dev/null | awk '$2!="lo" {print $2; exit}')"
+    echo "${global_if}"
 }
 
 detect_bind_ipv4() {
     local iface="$1"
     local ip_addr=""
-    ip_addr="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-    if [ -z "${ip_addr}" ] && [ -n "${iface}" ]; then
+    if [ -n "${iface}" ]; then
         ip_addr="$(ip -o -4 addr show dev "${iface}" scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')"
+    fi
+    if [ -z "${ip_addr}" ]; then
+        ip_addr="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
     fi
     echo "${ip_addr}"
 }
