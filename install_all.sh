@@ -98,6 +98,10 @@ patch_panel_public_port_ui() {
 BEGIN {
     @pairs = (
         [q{min="10000" max="65535"}, q{min="1"     max="65535"}],
+        [q{placeholder="10000-65535"}, q{placeholder="1-65535"    }],
+        [q{v4_port_start: 10000}, q{v4_port_start: 1    }],
+        [q{v6_port_start: 10000}, q{v6_port_start: 1    }],
+        [q{|| 10000}, q{|| 1    }],
         [q{$('#ipv4MappingPublicPort').attr('min', portRangeConfig.v4_port_start);}, q{$('#ipv4MappingPublicPort').attr('min', 1);}],
         [q{$('#ipv6MappingPublicPort').attr('min', portRangeConfig.v6_port_start);}, q{$('#ipv6MappingPublicPort').attr('min', 1);}],
         [q{$('#ipv4MappingPublicPort').attr('placeholder', `${portRangeConfig.v4_port_start}-${portRangeConfig.v4_port_end}`);}, q{$('#ipv4MappingPublicPort').attr('placeholder', `1-${portRangeConfig.v4_port_end}`);}],
@@ -127,9 +131,25 @@ PERL
     rm -f "${patch_script}"
 }
 
+ensure_sqlite3_cli() {
+    command -v sqlite3 >/dev/null 2>&1 && return 0
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y sqlite >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y sqlite >/dev/null 2>&1 || true
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache sqlite >/dev/null 2>&1 || true
+    fi
+}
+
 fix_port_range_config() {
     local db="${INSTALL_DIR}/lxdapi.db"
     [ -f "${db}" ] || return 0
+    ensure_sqlite3_cli
     command -v sqlite3 >/dev/null 2>&1 || return 0
 
     local table
