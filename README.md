@@ -1,6 +1,6 @@
 # Sakura LXDAPI Install
 
-Sakura LXDAPI 一键安装仓库，支持 Debian/Ubuntu。面板界面显示会尽量改为“服务器”，但 WHMCS/API 对接接口保持原版兼容，接口路径里的 `containers` 不要改。
+Sakura LXDAPI 一键安装仓库，支持 Debian/Ubuntu。面板界面尽量把“容器”显示为“服务器”，但 WHMCS/API 对接接口保持原版兼容，接口路径里的 `containers` 不要改。
 
 ## 一键安装
 
@@ -15,25 +15,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/ma
 - 安装并初始化 LXD
 - 安装 Sakura/LXDAPI 面板
 - 导入 LXD 镜像
-- 自动识别公网网卡，比如 `eth0`、`ens3`、`enp3s0`
+- 自动识别公网网卡，例如 `eth0`、`ens3`、`enp3s0`
 - 自动配置 `lxdbr0`、IP 转发、入站端口转发和出站 NAT
 - 安装 `sakura-lxdapi-repair.timer`，重启后也会自动补 NAT/SSH 规则
-
-## 修复已有安装
-
-如果已经安装过，只想修复 NAT、SSH、网卡识别、面板文字和 ACME 卡死问题，执行：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main/install_all.sh) fix
-```
-
-修复后可检查：
-
-```bash
-systemctl status sakura-lxdapi-repair.timer --no-pager
-nft list ruleset | grep -E 'sakura_lxdapi_nat|sakura_lxdapi_snat|masquerade'
-iptables -t nat -S POSTROUTING | grep MASQUERADE
-```
 
 ## 管理命令
 
@@ -41,7 +25,7 @@ iptables -t nat -S POSTROUTING | grep MASQUERADE
 # 打开菜单
 bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main/install_all.sh)
 
-# 一键完整安装：LXD + 面板 + 镜像
+# 完整安装：LXD + 面板 + 镜像
 bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main/install_all.sh) install
 
 # 只安装 LXD
@@ -56,7 +40,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/ma
 # 更新面板
 bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main/install_all.sh) update
 
-# 修复 NAT/SSH/面板运行环境
+# 修复 NAT/SSH/面板文字/背景图/自定义公网端口
 bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main/install_all.sh) fix
 
 # 卸载面板，不删除 LXD 和已创建服务器
@@ -79,6 +63,22 @@ https://1.2.3.4:8443/admin/login
 
 默认使用自签名证书，浏览器提示“不安全”是正常现象。WHMCS 对接时开启 SSL，模块一般会跳过证书验证。
 
+## 修复已有安装
+
+如果已经安装过，只想修复 NAT、SSH、网卡识别、面板文字、背景图 UI、ACME 卡死或自定义公网端口问题，执行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/lovejapan1/lxdapi_install/main/install_all.sh) fix
+```
+
+修复后可检查：
+
+```bash
+systemctl status sakura-lxdapi-repair.timer --no-pager
+nft list ruleset | grep -E 'sakura_lxdapi_nat|sakura_lxdapi_snat|masquerade'
+iptables -t nat -S POSTROUTING | grep MASQUERADE
+```
+
 ## NAT 和端口转发说明
 
 脚本会自动识别真实公网网卡，不需要手动写死 `eth0` 或 `enp3s0`。如果旧规则里残留不存在的网卡，`fix` 会自动清理，并只保留当前系统真实存在的出口网卡。
@@ -92,11 +92,24 @@ https://1.2.3.4:8443/admin/login
 - 自动启动服务器内的 SSH 服务
 - 每 30 秒由 `sakura-lxdapi-repair.timer` 自动补规则
 
-容器/服务器内测试外网：
+端口映射里：
+
+- `公网端口` 是外部访问端口，留空时随机分配。
+- `服务端口` 是服务器内部端口，例如 SSH 是 `22`，网站是 `80`。
+- 手动自定义公网端口现在放开到 `1-65535`。
+- 旧规则如果创建后无效，请先删除旧规则，再重新添加。
+
+服务器内测试外网：
 
 ```bash
 lxc exec 服务器名 -- sh -lc 'ip route; wget -T 15 -O- https://raw.githubusercontent.com 2>&1 | head'
 ```
+
+## 品牌和背景图
+
+`fix` 会修复后台品牌设置里的背景图透明度逻辑。现在 UI 里的“背景透明度 100%”表示背景图完全显示，“0%”表示白色遮罩最强。
+
+旧环境执行 `fix` 后，需要在后台品牌设置里重新点一次保存，旧背景图设置才会按新逻辑写入。
 
 ## WHMCS API 对接插件
 
