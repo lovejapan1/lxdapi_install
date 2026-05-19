@@ -88,6 +88,57 @@ PERL
     rm -f "${patch_script}"
 }
 
+patch_panel_public_port_ui() {
+    [ -d "${INSTALL_DIR}" ] || return 0
+    command -v perl >/dev/null 2>&1 || return 0
+
+    local patch_script
+    patch_script="$(mktemp)"
+    cat >"${patch_script}" <<'PERL'
+BEGIN {
+    @pairs = (
+        [q{min="10000" max="65535"}, q{min="1"     max="65535"}],
+        [q{$('#ipv4MappingPublicPort').attr('min', portRangeConfig.v4_port_start);}, q{$('#ipv4MappingPublicPort').attr('min', 1);}],
+        [q{$('#ipv6MappingPublicPort').attr('min', portRangeConfig.v6_port_start);}, q{$('#ipv6MappingPublicPort').attr('min', 1);}],
+        [q{$('#ipv4MappingPublicPort').attr('placeholder', `${portRangeConfig.v4_port_start}-${portRangeConfig.v4_port_end}`);}, q{$('#ipv4MappingPublicPort').attr('placeholder', `1-${portRangeConfig.v4_port_end}`);}],
+        [q{$('#ipv6MappingPublicPort').attr('placeholder', `${portRangeConfig.v6_port_start}-${portRangeConfig.v6_port_end}`);}, q{$('#ipv6MappingPublicPort').attr('placeholder', `1-${portRangeConfig.v6_port_end}`);}],
+    );
+}
+
+for my $pair (@pairs) {
+    my ($from, $to) = @$pair;
+    next if length($to) > length($from);
+    $to .= ' ' x (length($from) - length($to));
+    s/\Q$from\E/$to/g;
+}
+PERL
+
+    find "${INSTALL_DIR}" -maxdepth 1 -type f -name 'lxdapi-*' 2>/dev/null | while read -r bin; do
+        [ -n "${bin}" ] || continue
+        cp -a "${bin}" "${bin}.bak_port_ui" 2>/dev/null || true
+        if perl -0pi "${patch_script}" "${bin}" 2>/dev/null; then
+            rm -f "${bin}.bak_port_ui"
+        else
+            mv -f "${bin}.bak_port_ui" "${bin}" 2>/dev/null || true
+        fi
+        chmod +x "${bin}" 2>/dev/null || true
+    done
+
+    rm -f "${patch_script}"
+}
+
+fix_port_range_config() {
+    local db="${INSTALL_DIR}/lxdapi.db"
+    [ -f "${db}" ] || return 0
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+
+    local table
+    table="$(sqlite3 "${db}" ".tables" 2>/dev/null | tr ' ' '\n' | grep -E '^port_range_configs?$' | head -n1 || true)"
+    [ -n "${table}" ] || return 0
+
+    sqlite3 "${db}" "UPDATE ${table} SET v4_port_start=1, v4_port_end=65535, v6_port_start=1, v6_port_end=65535;" >/dev/null 2>&1 || true
+}
+
 restart_panel() {
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q '^lxdapi.service'; then
         systemctl restart lxdapi >/dev/null 2>&1 || true
@@ -97,8 +148,10 @@ restart_panel() {
 apply_extra_fixes() {
     patch_panel_words
     patch_panel_background_ui
+    patch_panel_public_port_ui
+    fix_port_range_config
     restart_panel
-    ok "面板品牌背景图 UI 已修复"
+    ok "面板品牌/背景图/自定义公网端口 UI 已修复"
 }
 
 main() {
@@ -117,6 +170,7 @@ main() {
 
     if [ "${1:-}" = "fix" ] || [ "${1:-}" = "repair" ]; then
         warn "背景图旧设置需要在后台品牌设置里重新点一次保存才会按新透明度逻辑写入"
+        warn "自定义公网端口已放开到 1-65535；如旧规则无效，请删除旧规则后重新添加"
     fi
 }
 
